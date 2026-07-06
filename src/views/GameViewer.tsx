@@ -1,0 +1,2815 @@
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useGameData } from "../contexts/GameDataContext";
+import { useSettings } from "@/contexts/SettingsContext";
+import { useGameplay } from "@/contexts/GameplayContext";
+import { processStatCode } from "@/contexts/GameplayContextUtils";
+import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Input } from "@/components/ui/input";
+import { Checkbox } from "@/components/ui/checkbox";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Collapsible, CollapsibleTrigger, CollapsibleContent } from "@/components/ui/collapsible";
+import {
+  Pagination,
+  PaginationContent,
+  PaginationEllipsis,
+  PaginationItem,
+  PaginationLink,
+  PaginationNext,
+  PaginationPrevious,
+} from "@/components/ui/pagination";
+import { Music, SquarePen, Database, ScrollText, ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, Search, Eye, EyeOff, Download } from "lucide-react";
+import IndeterminateProgress from "../components/ui/indeterminate-progress";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { toast } from "react-toastify";
+import { ThemedToastContainer } from "@/components/ThemedToastContainer";
+import "react-toastify/dist/ReactToastify.css";
+import TTSModal, { type TTSModalHandle, type TTSProgress } from "../components/game/TTSModal";
+import ReadmeModal from "../components/game/ReadmeModal";
+import { useReadmeVisibility } from "@/lib/useReadmeVisibility";
+import { EntityModal } from "../components/modals/EntityModal";
+import { LocationModal } from "../components/modals/LocationModal";
+import { SettingsModal } from "../components/modals/SettingsModal";
+import { MenuModal } from "../components/modals/MenuModal";
+import WorldEditor from "./WorldEditor";
+import type { CharacterData, ChatMessage, ChatRole, AIRequestType, AITurnResult, StatChange, Trait, GameLocation, MediaAsset, Dictionary, Entity } from "@/types";
+import { UnsavedChangesDialog } from "../components/UnsavedChangesDialog";
+import { estimateHistoryChars, estimateTokens } from "../lib/memoryUtils";
+import { parseNarration, stripReasoning, stripReasoningLive } from "../lib/aiResponse";
+import {
+  INLINE_THINKING_DIRECTIVE,
+  markdownGuidance,
+  planDirective,
+  defaultDiscoverEntityPrompt,
+  OPENING_SCENE_CUE,
+} from "../components/game/GamePrompts";
+import {
+  buildDiaryUserMessage,
+  runStagedPlanning,
+} from "../lib/stagedPlanning";
+import { selectDueDiscovery, materializeDiscoveredEntity, mergeDiscoveredIntoLocation, cleanDiscoveredDescription, selectReachableVisitors, DISCOVER_NAME_LABEL, DISCOVER_PASSAGE_LABEL } from "../lib/runtimeCharacters";
+import { lengthGuidance, trimToLastSentence } from "../lib/outputLength";
+import { splitSentenceSegments } from "../lib/ttsChunks";
+import { selectDueDigests, applyDigest, parseTurnContent, selectDueDiaries, pendingDiaryNames, applyDiary } from "../lib/turnDigest";
+import { buildTraitContext } from "../lib/traitTree";
+import { buildLocationContext, buildEntityContext, buildSublocationsContext, buildSublocationEntitiesContext, buildReachableLocationsContext, buildReachableEntitiesContext, buildDestinationsContext, navigableDestinations, sublocationEntityIds } from "../lib/locationContext";
+import { resolveStartingLocation } from "../lib/startingLocation";
+import { NONE_PLACEHOLDER } from "../lib/promptFallbacks";
+import { renderPromptTemplate } from "../lib/promptTemplate";
+import { useBaselineTestHook } from "../lib/baselineTestHook";
+import { parseTurns, buildVerbatimHistory, buildBandedHistory, extractKeywords, type BandCounts } from "../lib/turnBanding";
+import { findEntityNames, matchNames, matchNamesLoose, sameCharacterName } from "../lib/entityMatch";
+import { parseChoices } from "../lib/choices";
+import { useSmoothedReveal } from "../lib/useSmoothedReveal";
+import { setGameplayText } from "../lib/gameplayTextStore";
+import { parseSlashCommand } from "../lib/slashCommands";
+import { MARKDOWN_SAMPLE } from "../lib/markdownSample";
+import { normalizeStatChanges, applyAiStatChanges, applyTraitStatChanges, parseStatUpdates, applyAiMaxChanges } from "../lib/statChanges";
+import { matchLocationResponse } from "../lib/locationMatch";
+import { rollbackState, regenerateState, canRegenerate, lastTurnAction, markRegeneratedTurn, markPrunedTurns, snapshotPageIndex, placeSnapshot } from "../lib/turnHistory";
+import { useDeferredSnapshot } from "../lib/useDeferredSnapshot";
+import { statMorphMap } from "../lib/bodyMorphs";
+import { getActivatedDictionary, buildDictionaryContext, parseKeywords } from "../lib/dictionaryUtils";
+import { restyle } from "../lib/sectionStyle";
+import { highlightSegments, HIGHLIGHT_PALETTE, type HighlightRule, type HighlightSegment } from "../lib/highlightUtils";
+import { useIsMobile } from "../lib/useIsMobile";
+import {
+  LeftPanel,
+  MiddlePanel,
+  RightPanel,
+} from "../components/game/GamePanels";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+
+interface GameViewerProps {
+  initialTraits?: string[];
+  initialCharacterData: CharacterData | null;
+  initialLocationId?: string | null;
+  /** Per-playthrough dictionary set chosen at the entry step; null when the step was skipped (falls back
+   *  to the world's authored books). */
+  initialDictionaries?: Dictionary[] | null;
+  /** Library characters chosen at the entry step to place in the starting location this playthrough (runtime
+   *  only — seeded as `discoveredEntities`, never written to the authored world). */
+  initialCharacters?: Entity[] | null;
+  onExitToMenu: () => void;
+}
+
+// One AI sub-request captured per turn for the AI-context viewer (its sent messages + raw response).
+interface DebugRequest {
+  type: string;
+  messages: ChatMessage[];
+  response?: string;
+}
+interface DebugTurn {
+  action: string;
+  requests: DebugRequest[];
+  turnId?: string; // ties this turn to its assistant message, so the viewer can show its memory digest
+  regenerated?: boolean; // this turn was superseded by a re-generate of the same action
+  pruned?: boolean; // this turn was discarded by a rollback to an earlier page
+  aborted?: boolean; // this turn was stopped before any narration landed (its user message was dropped)
+}
+
+// Each completed turn is digested as soon as it commits (same-turn), so a summary is always ready for
+// the next turn's context assembly. Small cap on each digest request — a condensed retelling is short.
+const DIGEST_MAX_TOKENS = 200;
+
+// Per-character diary entries are short, first-person, 1-2 sentences — a small cap keeps them terse.
+const DIARY_MAX_TOKENS = 80;
+
+// A discovered character's reference description runs ~2 short paragraphs; the response is trimmed to
+// the last full sentence, so this cap just needs headroom to avoid a mid-word cut.
+const DISCOVER_MAX_TOKENS = 200;
+
+// How many of a character's own recent diary entries to feed into its motivation pass (its memory).
+const DIARY_MEMORY_ENTRIES = 5;
+
+// Output caps for the staged planning passes. Sized for the verbose small tier (Rocinante 12B) so cast
+// lists and intents complete rather than truncate mid-word — a cut cast member is lost from the whole turn.
+const DIRECTOR_MAX_TOKENS = 320;
+const CHARACTER_MAX_TOKENS = 256;
+const STORYBOARD_MAX_TOKENS = 300;
+// Cap on older turns rehydrated to full text per turn — rehydration is a targeted aid, not bulk restore.
+const DIGEST_MAX_REHYDRATIONS = 3;
+// How many recent turns count as "currently in the scene" for the choices entity filter (this turn plus
+// the prior CHOICES_PRESENCE_TURNS-1), so a character named earlier but only implied now isn't dropped.
+const CHOICES_PRESENCE_TURNS = 3;
+
+// Participant names stored on the most recent `turns` assistant turns that carry participation data
+// (turns predating the feature / the current placeholder have no `entities` field and are skipped).
+const recentParticipants = (history: ChatMessage[], turns: number): string[] => {
+  const names: string[] = [];
+  let seen = 0;
+  for (let i = history.length - 1; i >= 0 && seen < turns; i--) {
+    if (history[i].role !== "assistant") continue;
+    const parsed = parseTurnContent(history[i].content);
+    if (!parsed || parsed.entities === undefined) continue;
+    names.push(...parsed.entities);
+    seen += 1;
+  }
+  return names;
+};
+
+const GameViewer = ({
+  initialTraits = [],
+  initialCharacterData,
+  initialLocationId = null,
+  initialDictionaries = null,
+  initialCharacters = null,
+  onExitToMenu,
+}: GameViewerProps) => {
+  // AbortController reference for canceling AI requests
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const {
+    stats,
+    locations,
+    entities,
+    traits,
+    traitGroups,
+    dictionaries,
+    worldOverview,
+    worldId,
+    isWorldDirty,
+    saveWorld,
+  } = useGameData();
+
+  // World README popup — shown once on entry (new game or save load) when the world has README text and
+  // its per-world "show readme" flag is on. The flag is shared with the main-menu "Show Readme" toggle.
+  const { showReadme, setShowReadme } = useReadmeVisibility();
+  const readmeText = worldOverview?.readme?.trim() ?? "";
+  const [showReadmeModal, setShowReadmeModal] = useState(() => !!readmeText && showReadme(worldId));
+
+  const {
+    bgmEnabled,
+    setBgmEnabled,
+    language,
+    setLanguage,
+    paragraphLimit,
+    markdownOutput,
+    streamNarrationAudio,
+    // Active endpoint settings: the user's values when "Use Custom Endpoint" is on, built-in defaults otherwise.
+    activeEndpointUrl: endpointUrl,
+    activeApiToken: apiToken,
+    activeModelName: modelName,
+    activeMaxTokens: maxTokens,
+    contextWindow,
+    systemPrompt,
+    choicesPrompt,
+    statUpdatesPrompt,
+    locationChangePromptText,
+    choicesEnabled,
+    statUpdatesEnabled,
+    locationChangeEnabled,
+    locationAutoApply,
+    narrationVerbatimTurns,
+    thinkingVerbatimTurns,
+    thinkingMode,
+    thinkingPrompt,
+    memoryDigests,
+    summaryPrompt,
+    characterDiaries,
+    diaryPrompt,
+    directorPrompt,
+    directorUserPrompt,
+    characterPrompt,
+    storyboardPrompt,
+    choicesUserPrompt,
+    statUpdatesUserPrompt,
+    locationChangeUserPrompt,
+    summaryUserPrompt,
+    showSilentRequests,
+    activeSectionStyle,
+    locationBackground,
+    backgroundOverlay,
+  } = useSettings();
+
+  const {
+    setCharacterData,
+    setVisibleEntities,
+    currentLocation,
+    setCurrentLocation,
+    playerStats,
+    setPlayerStats,
+    playerTraits,
+    setPlayerTraits,
+    setRecentStatChanges,
+    addLogEntry,
+    logEntries,
+    setGameTime,
+    logsEndRef,
+    setChoices,
+    isGameStarted,
+    setIsGameStarted,
+    playerInput,
+    setPlayerInput,
+    isWaitingForAI,
+    setIsWaitingForAI,
+    fullMessageHistory,
+    setFullMessageHistory,
+    setDisplayedMessages,
+    currentPage,
+    setCurrentPage,
+    gameStates,
+    setGameStates,
+    setBodyMorphValues,
+    playerNotes,
+    setPlayerNotes,
+    saveGame,
+    loadGame,
+    saveCurrentGameState,
+    loadGameState,
+    discoveredEntities,
+    setDiscoveredEntities,
+    runtimeDictionary: dictionary,
+    setRuntimeDictionaries,
+  } = useGameplay();
+
+  // Runtime characters (Slice 2): director-invented characters promoted to persisted entities this
+  // playthrough behave like authored ones — union them into the AI-pipeline roster, and inject those
+  // anchored to a location into that location's roster so the location-scoped context includes them.
+  const allEntities = useMemo(
+    () => [...entities, ...discoveredEntities.map((d) => d.entity)],
+    [entities, discoveredEntities],
+  );
+  const withDiscovered = useCallback(
+    (loc: GameLocation | null | undefined): GameLocation | null =>
+      mergeDiscoveredIntoLocation(loc ?? undefined, discoveredEntities) ?? null,
+    [discoveredEntities],
+  );
+
+  // Smoothly plays streamed narration into gameplayText so it reads as continuous typing and the
+  // truncation trim happens off-screen (see lib/useSmoothedReveal).
+  const reveal = useSmoothedReveal(setGameplayText);
+
+  // Slash-command preview (e.g. `/markdown test`): drives `reveal` with local text, off the AI path.
+  const [commandPreview, setCommandPreview] = useState(false);
+  const commandTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopCommandPreview = useCallback(() => {
+    if (commandTimer.current !== null) {
+      clearInterval(commandTimer.current);
+      commandTimer.current = null;
+    }
+    setCommandPreview(false);
+  }, []);
+
+  // Type a sample through the real narration path (reveal → MarkdownRenderer), simulating token arrival so the
+  // markdown renderer can be eyeballed without invoking the AI.
+  const runMarkdownTest = useCallback(() => {
+    if (commandTimer.current !== null) clearInterval(commandTimer.current);
+    setCommandPreview(true);
+    reveal.reset();
+    let shown = 0;
+    // Slow pacing (~33 chars/sec) so the markdown auto-close can be eyeballed delimiter-by-delimiter.
+    const CHARS_PER_TICK = 2;
+    const TICK_MS = 60;
+    commandTimer.current = setInterval(() => {
+      shown = Math.min(MARKDOWN_SAMPLE.length, shown + CHARS_PER_TICK);
+      if (shown >= MARKDOWN_SAMPLE.length) {
+        if (commandTimer.current !== null) clearInterval(commandTimer.current);
+        commandTimer.current = null;
+        reveal.finish(MARKDOWN_SAMPLE);
+        return;
+      }
+      reveal.push(MARKDOWN_SAMPLE.slice(0, shown));
+    }, TICK_MS);
+  }, [reveal]);
+
+  // Dispatch a parsed slash command; returns true if it was handled (caller then skips the AI).
+  const runSlashCommand = useCallback((input: string): boolean => {
+    const parsed = parseSlashCommand(input);
+    if (!parsed) return false;
+    if (parsed.command === "markdown" && parsed.args[0] === "test") {
+      runMarkdownTest();
+      return true;
+    }
+    toast.info(`Unknown command: /${parsed.command}`);
+    return true;
+  }, [runMarkdownTest]);
+
+  // Clear any running command preview when this view unmounts.
+  useEffect(() => () => {
+    if (commandTimer.current !== null) clearInterval(commandTimer.current);
+  }, []);
+
+  useEffect(() => {
+    setCharacterData(initialCharacterData);
+  }, [initialCharacterData, setCharacterData]);
+
+  const [isTTSModalOpen, setIsTTSModalOpen] = useState(false);
+  const [ttsLoaded, setTtsLoaded] = useState(false);
+  const [ttsGenerating, setTtsGenerating] = useState(false);
+  const [ttsProgress, setTtsProgress] = useState<TTSProgress | null>(null);
+  const ttsModalRef = useRef<TTSModalHandle>(null);
+  const ttsSentenceCursorRef = useRef(0); // count of complete sentences already sent to streaming TTS
+  const entitySentenceCursorRef = useRef(0); // count of complete sentences already parsed for the entity tab
+  const assistantAddedRef = useRef(false); // whether this turn's in-progress assistant message is in history yet
+  const currentTurnIdRef = useRef(""); // stable id for the in-progress turn, stamped into its assistant JSON
+  const digestDrainingRef = useRef(false); // a memory digest is in flight (serializes the drainer)
+  const [digestActive, setDigestActive] = useState(false); // drives the status-bar indicator for a running digest
+  const diaryDrainingRef = useRef(false); // a character diary entry is in flight (serializes the drainer)
+  const [diaryActive, setDiaryActive] = useState(false); // drives the status-bar indicator for a running diary pass
+  const discoverDrainingRef = useRef(false); // a runtime-character describe request is in flight (serializes the drainer)
+  const [discoverActive, setDiscoverActive] = useState(false); // drives the status-bar indicator for a running discovery pass
+
+  // Generate TTS for `text` (or the current game text) with the busy flag set, so both the
+  // manual refresh button and auto-narration show the same spinner + chunk progress.
+  const generateTTS = async (text?: string): Promise<boolean> => {
+    setTtsGenerating(true);
+    setTtsProgress({ done: 0, total: 1 });
+    try {
+      return (await ttsModalRef.current?.regenerate(text, setTtsProgress)) ?? false;
+    } finally {
+      setTtsGenerating(false);
+      setTtsProgress(null);
+    }
+  };
+
+  // Refresh button: regenerate for the current text; if no model is loaded, open the modal.
+  const handleRegenerateTTS = async () => {
+    const ok = await generateTTS();
+    if (!ok) setIsTTSModalOpen(true);
+  };
+  const [selectedEntity, setSelectedEntity] = useState<string | null>(null);
+  const [isEntityModalOpen, setIsEntityModalOpen] = useState(false);
+  const [ambientSound, setAmbientSound] = useState<MediaAsset | null>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isEditingWorld, setIsEditingWorld] = useState(false);
+  const [uiHidden, setUiHidden] = useState(false); // hide all panels/buttons to reveal the background image
+  const [showEditorExitPrompt, setShowEditorExitPrompt] = useState(false);
+  const [lastPromptChars, setLastPromptChars] = useState(0);
+  const [suggestedLocation, setSuggestedLocation] = useState<GameLocation | null>(null);
+  // AI progress feedback: which request is running, its streamed output estimate (null = indeterminate), and
+  // whether the player may already type their next action (choices done, background requests still finishing).
+  const [aiRequestType, setAiRequestType] = useState<AIRequestType | null>(null);
+  const [choicesReady, setChoicesReady] = useState(false);
+  const [isDebugOpen, setIsDebugOpen] = useState(false);
+  // One entry per game turn, each holding the AI requests captured that turn (newest last).
+  const [debugTurns, setDebugTurns] = useState<DebugTurn[]>([]);
+  const [debugPage, setDebugPage] = useState(1); // 1-based page = index into visibleDebugTurns
+  const [disabledHighlights, setDisabledHighlights] = useState<Record<string, boolean>>({});
+  // AI-context highlight mode: dictionary entries vs the per-turn rehydration ("hydration") signal.
+  const [debugHighlightMode, setDebugHighlightMode] = useState<"dictionary" | "hydrations">("dictionary");
+  const [disabledHydrations, setDisabledHydrations] = useState<Record<string, boolean>>({});
+  const [debugSearch, setDebugSearch] = useState("");
+  const [collapsedDebug, setCollapsedDebug] = useState<Record<string | number, boolean>>({});
+  // When on (default), the viewer hides turns that aren't part of the live context — re-generated,
+  // rolled-back (pruned), and aborted ones — leaving only the pages the AI currently sees.
+  const [debugCurrentContextOnly, setDebugCurrentContextOnly] = useState(true);
+  const visibleDebugTurns = useMemo(
+    () => debugCurrentContextOnly
+      ? debugTurns.filter((t) => !t.regenerated && !t.pruned && !t.aborted)
+      : debugTurns,
+    [debugTurns, debugCurrentContextOnly],
+  );
+  // Jump to the newest visible turn whenever the set changes (a turn is captured, or the filter toggles).
+  useEffect(() => {
+    if (visibleDebugTurns.length > 0) setDebugPage(visibleDebugTurns.length);
+  }, [visibleDebugTurns.length]);
+  const isMobile = useIsMobile();
+  const [mobilePanel, setMobilePanel] = useState("game");
+  const [showPotatoPCDialog, setShowPotatoPCDialog] = useState(false);
+  const [isLocationModalOpen, setIsLocationModalOpen] = useState(false);
+
+  const getStatByName = useCallback(
+    (name: string) => {
+      return playerStats.find((stat) => stat.name === name);
+    },
+    [playerStats],
+  );
+
+  const setStatByName = useCallback((name: string, value: number) => {
+    setPlayerStats((prevStats) =>
+      prevStats.map((stat) =>
+        stat.name === name
+          ? { ...stat, value: Math.max(stat.min, Math.min(stat.max, value)) }
+          : stat,
+      ),
+    );
+  }, [setPlayerStats]);
+  const messagesPerPage = 2; // One AI message + one user message
+
+  const handleRollback = () => {
+    if (currentPage >= totalPages) return;
+    const targetState = rollbackState(gameStates, currentPage);
+    if (!targetState) return;
+    const success = loadGameState(targetState, locations);
+    if (!success) return;
+    addLogEntry("Rolled back to previous game state");
+    // Mark the AI-context entries for the turns this rollback discarded (those after the page we
+    // rolled back to). States after the current page are kept, allowing future "redo" functionality.
+    setDebugTurns((prev) => markPrunedTurns(prev, currentPage));
+    if (targetState.playerNotes !== undefined) {
+      setPlayerNotes(targetState.playerNotes);
+    }
+  };
+
+  // Export the whole playthrough's narration as a plain-text or Markdown file (user picks the format
+  // via the export dialog). Same sanitized text either way — format only sets the extension + MIME.
+  // Mirrors the blob-download pattern below.
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const exportStory = (format: 'txt' | 'md') => {
+    const story = fullMessageHistory
+      .filter((m) => m.role === 'assistant')
+      .map((m) => stripReasoning(parseNarration(m.content)).trim())
+      .filter((text) => text && text !== 'No narration available')
+      .join('\n\n');
+    const type = format === 'md' ? 'text/markdown' : 'text/plain';
+    const blob = new Blob([story], { type });
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    const slug = (worldOverview?.name || "world").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+    link.download = `story-${slug}.${format}`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(href);
+    setIsExportModalOpen(false);
+  };
+
+  // Export the full AI-context turn history (exactly the structure the debug viewer renders) as JSON,
+  // so it can be handed off for inspection. Mirrors the blob-download pattern in WorldEditor.
+  const handleExportDebugContext = () => {
+    const blob = new Blob([JSON.stringify(debugTurns, null, 2)], { type: "application/json" });
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    const slug = (worldOverview?.name || "world").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+    link.download = `ai-context-${slug}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(href);
+  };
+
+  // Re-generate the current turn: restore the snapshot from *before* it (which also rewinds the
+  // message history past it), then re-send the same player action for a fresh response. The re-send is
+  // deferred via `regenerateNonce` below — sendGameAction reads game state from its render's closure,
+  // so it must run after loadGameState has committed, not synchronously alongside it.
+  const pendingRegenerateRef = useRef<string | null>(null);
+  // Snapshot of the pre-game state (before the opening turn), so page 1 can also be re-generated —
+  // gameStates only holds post-turn snapshots, so the first turn has no predecessor there. Captured in
+  // sendGameAction on the first turn.
+  const initialStateRef = useRef<ReturnType<typeof saveCurrentGameState> | null>(null);
+  // A completed turn dispatches several state updates together (finalized message, applied stat changes,
+  // advanced time). Saving the snapshot synchronously alongside them captures a stale, half-applied state
+  // — and inside the async turn flow the closure's length is stale too, which misaligns gameStates. So we
+  // defer the snapshot to the next commit (after the batch lands) and index it by its own history length.
+  const { arm: armTurnSnapshot } = useDeferredSnapshot(
+    fullMessageHistory,
+    saveCurrentGameState,
+    (snapshot) => {
+      const pageIndex = snapshotPageIndex(snapshot.fullMessageHistory?.length ?? 0, messagesPerPage);
+      setGameStates((prev) => placeSnapshot(prev, pageIndex, snapshot));
+    },
+  );
+  const [regenerateNonce, setRegenerateNonce] = useState(0);
+
+  const handleRegenerate = () => {
+    if (!canRegenerate(currentPage, totalPages)) return;
+    const previousState = regenerateState(gameStates, initialStateRef.current, currentPage);
+    const action = lastTurnAction(fullMessageHistory);
+    if (!previousState || action === null) return;
+    loadGameState(previousState, locations);
+    // Mark the current turn's AI-context entry as superseded; sendGameAction appends a fresh one.
+    setDebugTurns((prev) => markRegeneratedTurn(prev));
+    pendingRegenerateRef.current = action;
+    setRegenerateNonce((n) => n + 1);
+  };
+
+  // Read the committed latest turn + its originating action, or null when a partial re-generate can't run
+  // (busy, not on the latest page, or the turn can't be parsed).
+  const partialRegenTarget = () => {
+    if (isWaitingForAI || !canRegenerate(currentPage, totalPages)) return null;
+    const last = fullMessageHistory[fullMessageHistory.length - 1];
+    if (!last || last.role !== "assistant") return null;
+    const prev = parseTurnContent(last.content);
+    const action = lastTurnAction(fullMessageHistory);
+    if (!prev || action === null) return null;
+    return { prev, action };
+  };
+
+  // Replace one slice of the latest assistant turn's JSON, preserving every other field.
+  const patchLatestTurn = (patch: Partial<AITurnResult>) => {
+    setFullMessageHistory((history) => {
+      const updated = [...history];
+      const i = updated.length - 1;
+      const cur = i >= 0 && updated[i].role === "assistant" ? parseTurnContent(updated[i].content) : null;
+      if (cur) updated[i] = { role: "assistant", content: JSON.stringify({ ...cur, ...patch }) };
+      return updated;
+    });
+  };
+
+  // Shared busy/abort wrapper for a partial re-generate (one aux request against the existing narration).
+  const runPartialRegen = async (run: (signal: AbortSignal) => Promise<void>) => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    setIsWaitingForAI(true);
+    try {
+      await run(controller.signal);
+    } catch (error) {
+      addLogEntry((error as Error).message);
+    } finally {
+      setIsWaitingForAI(false);
+      setAiRequestType(null);
+      if (abortControllerRef.current === controller) abortControllerRef.current = null;
+    }
+  };
+
+  // Re-roll only the choices for the latest turn, keeping its narration and stats.
+  const handleRegenerateChoices = () => {
+    const target = partialRegenTarget();
+    if (!target || !choicesEnabled) return;
+    const { prev, action } = target;
+    void runPartialRegen(async (signal) => {
+      const ctx = buildContextValues();
+      const presentNames = new Set([
+        ...(prev.entities ?? []),
+        ...recentParticipants(fullMessageHistory, CHOICES_PRESENCE_TURNS - 1),
+      ]);
+      const sceneEntities = allEntities.filter((e) => presentNames.has(e.name));
+      const sceneLoc = withDiscovered(currentLocation);
+      let systemPrompt = renderPromptTemplate(choicesPrompt, {
+        ...ctx,
+        "<ENTITIES>": buildEntityContext(sceneLoc, sceneEntities),
+        "<ENTITIES|summary>": buildEntityContext(sceneLoc, sceneEntities, { preferSummary: true }),
+        "<ENTITIES|markdown>": buildEntityContext(sceneLoc, sceneEntities, { format: "markdown" }),
+        "<ENTITIES|summary.markdown>": buildEntityContext(sceneLoc, sceneEntities, { preferSummary: true, format: "markdown" }),
+      });
+      if (language.toLowerCase() != "english") systemPrompt += `\n Choice language: ` + language;
+      const response = await makeAIRequest(
+        systemPrompt,
+        [{ role: "user", content: renderPromptTemplate(choicesUserPrompt, { "<PLAYER ACTION>": action, "<NARRATION>": prev.narration ?? "" }) }],
+        "choices",
+        null,
+        signal,
+      );
+      if (signal.aborted) return;
+      const choices = parseChoices(response);
+      setChoices(choices);
+      patchLatestTurn({ choices });
+      armTurnSnapshot();
+    });
+  };
+
+  // Re-roll only the stat changes for the latest turn. Deltas are applied onto the pre-turn baseline
+  // (not the current, already-changed stats), so repeated re-rolls don't stack.
+  const handleRegenerateStats = () => {
+    const target = partialRegenTarget();
+    if (!target || !statUpdatesEnabled || playerStats.length === 0) return;
+    const baseline = regenerateState(gameStates, initialStateRef.current, currentPage)?.playerStats;
+    if (!baseline) return;
+    const { prev, action } = target;
+    void runPartialRegen(async (signal) => {
+      let systemPrompt = renderPromptTemplate(statUpdatesPrompt, buildContextValues());
+      if (language.toLowerCase() != "english") systemPrompt += "\n Please write in english";
+      const response = await makeAIRequest(
+        systemPrompt,
+        [{ role: "user", content: renderPromptTemplate(statUpdatesUserPrompt, { "<PLAYER ACTION>": action, "<NARRATION>": prev.narration ?? "" }) }],
+        "statUpdates",
+        null,
+        signal,
+      );
+      if (signal.aborted) return;
+      const { values, maxes } = parseStatUpdates(response);
+      const statChanges = Object.entries(values).map(([k, v]) => ({ [k]: v }));
+      // Max-cap deltas first (may re-clamp), then value deltas onto that baseline via applyStatChanges.
+      await applyStatChanges(statChanges, null, applyAiMaxChanges(baseline, maxes));
+      patchLatestTurn({ stat_changes: statChanges });
+      armTurnSnapshot();
+    });
+  };
+
+  const addMessageToHistory = useCallback((role: ChatRole, content: string) => {
+    setFullMessageHistory((prev) => [...prev, { role, content }]);
+  }, [setFullMessageHistory]);
+
+  // Assemble the history sent to the model. Banding (memoryDigests) keeps a recent
+  // verbatim floor, folds older turns into a "story so far" digest band, and rehydrates a few older turns
+  // the action lexically touches; otherwise the legacy verbatim-newest-first trim. Keywords come from the
+  // player's `action` only — seeding from full narration over-matches and rehydrates everything. The
+  // meter passes no action, so it shows the steady-state band cost with no rehydration.
+  const lastBandCountsRef = useRef<BandCounts | null>(null);
+
+  const getTrimmedMessageHistory = useCallback((promptTokens = 0, action = "") => {
+    const turns = parseTurns(fullMessageHistory);
+    if (memoryDigests) {
+      const keywords = extractKeywords(action, dictionary);
+      // Entities the action references (case-insensitive — actions are lowercase) drive participation rehydration.
+      const actionEntities = findEntityNames(action, allEntities, { requireCapital: false });
+      const rehydrateCap = Math.round(Math.max(0, contextWindow - promptTokens - maxTokens) * 0.25);
+      const { messages, counts } = buildBandedHistory({
+        turns,
+        contextWindow,
+        promptTokens,
+        maxTokens,
+        verbatimFloor: narrationVerbatimTurns,
+        keywords,
+        actionEntities,
+        rehydrateCap,
+        maxRehydrations: DIGEST_MAX_REHYDRATIONS,
+      });
+      lastBandCountsRef.current = counts;
+      return messages;
+    }
+    lastBandCountsRef.current = null;
+    return buildVerbatimHistory(turns, contextWindow, promptTokens, maxTokens);
+  }, [fullMessageHistory, contextWindow, maxTokens, memoryDigests, dictionary, allEntities, narrationVerbatimTurns]);
+
+  // Drive body morphs from stats: each stat's bound sliders track its value (min→max → 0→1 influence).
+  useEffect(() => {
+    setBodyMorphValues(statMorphMap(playerStats));
+  }, [playerStats, setBodyMorphValues]);
+
+  const handleTimePassed = useCallback(
+    (hours: number) => {
+      setGameTime((prevTime) => prevTime + hours);
+
+      // Track regen changes
+      const regenChanges: Record<string, number> = {};
+
+      setPlayerStats((prevStats) =>
+        prevStats.map((stat) => {
+          if (stat.regen) {
+            const baseRegenAmount = stat.regen * hours;
+            const newValue = Math.max(
+              stat.min,
+              Math.min(stat.max, stat.value + baseRegenAmount),
+            );
+
+            // Calculate the actual change that occurred
+            const actualRegenAmount = newValue - stat.value;
+
+            if (actualRegenAmount !== 0) {
+              regenChanges[stat.name.toLowerCase()] = actualRegenAmount;
+            }
+
+            return { ...stat, value: newValue };
+          }
+          return stat;
+        }),
+      );
+
+      // Update recent stat changes with regen changes
+      setRecentStatChanges((prev) => {
+        const newChanges = { ...prev };
+        Object.entries(regenChanges).forEach(([key, value]) => {
+          newChanges[key] = (newChanges[key] || 0) + value;
+        });
+        return newChanges;
+      });
+
+      const health = getStatByName("Health");
+      const hunger = getStatByName("Hunger");
+      if (health && hunger) {
+        if (hunger.value <= 20) {
+          const healthLoss = 5 * hours;
+          setStatByName("Health", health.value - healthLoss);
+          addLogEntry(`You're starving! Lost ${healthLoss} health.`);
+          // Add health loss to recent changes
+          setRecentStatChanges((prev) => ({
+            ...prev,
+            health: (prev.health || 0) - healthLoss,
+          }));
+        }
+      }
+
+      // Process any code-based stats after all direct changes
+      //REMOVE
+      // setTimeout(async () => {
+      //   try {
+      //     const updatedStats = await processStatCode(playerStats);
+      //     if (updatedStats !== playerStats) {
+      //       setPlayerStats(updatedStats);
+      //     }
+      //   } catch (error) {
+      //     console.error('Error processing stat code after time passed:', error);
+      //   }
+      // }, 0);
+    },
+    [getStatByName, setStatByName, addLogEntry, setGameTime, setPlayerStats, setRecentStatChanges],
+  );
+
+  const getEndpointUrl = () => endpointUrl;
+
+  const generateTraitDescriptions = useCallback((format: 'simple' | 'markdown' = 'simple') => {
+    if (!playerTraits.length) {
+      return NONE_PLACEHOLDER;
+    }
+    // Group-aware: each selected trait's group emits its AI header above its traits (blank → omitted).
+    return buildTraitContext(playerTraits.map((t) => t.id), playerTraits, traitGroups, format);
+  }, [playerTraits, traitGroups]);
+
+  // The Stats chip has two axes. Content: 'full' (values + descriptor), 'numbers' (values only),
+  // 'descriptions' (descriptor only, falling back to the number so a prompt isn't left blind). Format:
+  // 'simple' (plain "Name: body" lines) or 'markdown' ("- **Name:** body" bullets, clearer for small models).
+  const generateStatDescriptions = useCallback((
+    content: 'full' | 'numbers' | 'descriptions' = 'full',
+    format: 'simple' | 'markdown' = 'simple',
+  ) => {
+    if (!playerStats.length) return NONE_PLACEHOLDER;
+    return playerStats
+      .map((stat) => {
+        const percentage =
+          ((stat.value - stat.min) / (stat.max - stat.min)) * 100;
+        const descriptor = stat.descriptors.find(
+          (d) => percentage <= d.threshold,
+        );
+        const body =
+          content === 'descriptions' && descriptor ? descriptor.description
+          : content === 'numbers' ? `${stat.value}/${stat.max}`
+          : `${stat.value}/${stat.max} (${descriptor ? descriptor.description : "Unknown"})`;
+        return format === 'markdown' ? `- **${stat.name}:** ${body}` : `${stat.name}: ${body}`;
+      })
+      .join("\n");
+  }, [playerStats]);
+
+  // The six shared context chips every system prompt can reference, resolved from current state. Each
+  // request spreads these as its base, then layers on its own tokens (length/markdown, scene entities, etc.).
+  const buildContextValues = useCallback((): Record<string, string> => {
+    // Who's present at the current location (authored + any discovered/visiting), used to keep the
+    // reachable-entities roster from re-listing someone who has already come over.
+    const presentIds = withDiscovered(currentLocation)?.entities ?? [];
+    const here = withDiscovered(currentLocation);
+    type CtxOpts = { preferSummary?: boolean; format?: "simple" | "markdown" };
+
+    // Entity roster precedence: here > sub-location > reachable. A character shows only in the highest scope
+    // it belongs to — sub-location drops anyone present here; reachable drops present + sub-location ids.
+    const subEntityIds = sublocationEntityIds(currentLocation, locations);
+    const reachableExclude = [...presentIds, ...subEntityIds];
+
+    // The <LOCATION> and <ENTITIES> chips each carry a `scope` axis; each scope maps to its builder.
+    const locationScopes: Record<string, (opts: CtxOpts) => string> = {
+      "": (opts) => buildLocationContext(currentLocation, opts),
+      sublocations: (opts) => buildSublocationsContext(currentLocation, locations, opts),
+      reachable: (opts) => buildReachableLocationsContext(currentLocation, locations, opts),
+      destinations: (opts) => buildDestinationsContext(currentLocation, locations, opts),
+    };
+    const entityScopes: Record<string, (opts: CtxOpts) => string> = {
+      "": (opts) => buildEntityContext(here, allEntities, opts),
+      sublocations: (opts) => buildSublocationEntitiesContext(currentLocation, locations, allEntities, { ...opts, excludeIds: presentIds }),
+      reachable: (opts) => buildReachableEntitiesContext(currentLocation, locations, allEntities, { ...opts, excludeIds: reachableExclude }),
+    };
+
+    const values: Record<string, string> = {
+      "<WORLD DESCRIPTION>": worldOverview.systemPrompt || "",
+      "<STATS DESCRIPTION>": generateStatDescriptions('full', 'simple'),
+      "<STATS DESCRIPTION|numbers>": generateStatDescriptions('numbers', 'simple'),
+      "<STATS DESCRIPTION|descriptions>": generateStatDescriptions('descriptions', 'simple'),
+      "<STATS DESCRIPTION|markdown>": generateStatDescriptions('full', 'markdown'),
+      "<STATS DESCRIPTION|numbers.markdown>": generateStatDescriptions('numbers', 'markdown'),
+      "<STATS DESCRIPTION|descriptions.markdown>": generateStatDescriptions('descriptions', 'markdown'),
+      "<TRAITS DESCRIPTION>": generateTraitDescriptions('simple'),
+      "<TRAITS DESCRIPTION|markdown>": generateTraitDescriptions('markdown'),
+      "<NOTES>": playerNotes || NONE_PLACEHOLDER,
+    };
+
+    // Generate every scope × content (full/summary) × format (simple/markdown) variant token. The id order
+    // (scope.content.format) mirrors the chip's axis order, so tokens match what encodeVariant produces.
+    const addScoped = (base: string, scopes: Record<string, (opts: CtxOpts) => string>) => {
+      for (const [scope, build] of Object.entries(scopes)) {
+        for (const preferSummary of [false, true]) {
+          for (const markdown of [false, true]) {
+            const id = [scope, preferSummary ? "summary" : "", markdown ? "markdown" : ""].filter(Boolean).join(".");
+            const token = id ? `${base.slice(0, -1)}|${id}>` : base;
+            values[token] = build({ preferSummary, format: markdown ? "markdown" : "simple" });
+          }
+        }
+      }
+    };
+    addScoped("<LOCATION>", locationScopes);
+    addScoped("<ENTITIES>", entityScopes);
+
+    return values;
+  }, [
+    worldOverview, generateStatDescriptions, generateTraitDescriptions,
+    currentLocation, locations, withDiscovered, allEntities, playerNotes,
+  ]);
+
+  // Live variable values for the Settings prompt-editor Preview tab (full-description variant, like the
+  // game-text request). Only meaningful in-game, which is the only place this modal receives them.
+  const promptPreviewValues = useMemo<Record<string, string>>(() => ({
+    ...buildContextValues(),
+    "<LENGTH GUIDANCE>": lengthGuidance(paragraphLimit, maxTokens),
+    "<MARKDOWN GUIDANCE>": restyle(markdownGuidance(markdownOutput), activeSectionStyle),
+    "<DICTIONARY>": "keyword-triggered lore active this turn (or N/A)",
+    "<DICTIONARY|before>": "background lore active this turn (or N/A)",
+    // Illustrative placeholders for the aux user-message templates (real values are per-turn at runtime).
+    "<PLAYER ACTION>": "the player's latest action",
+    "<NARRATION>": "the most recent narration",
+    "<CHARACTER NAME>": "the speaking character",
+  }), [buildContextValues, paragraphLimit, maxTokens, markdownOutput, activeSectionStyle]);
+
+  const sendGameAction = async (action: string) => {
+    if (!isGameStarted && action !== "START GAME") return;
+    stopCommandPreview(); // a real turn supersedes any command preview
+    // On the opening turn, snapshot the pre-game state so page 1 can be re-generated later.
+    if (fullMessageHistory.length === 0) initialStateRef.current = saveCurrentGameState();
+
+    // The shared context base (incl. all three Stats-chip variants); every system-prompt render below
+    // spreads it and adds its own tokens.
+    const ctx = buildContextValues();
+
+    // Dictionary/lorebook entries active this turn. The current scene (location + entities present + action) is
+    // always scanned; message history is scanned per entry up to its `scanDepth` (all of it when unset). The
+    // always-present world description is intentionally excluded so its terms don't fire every turn.
+    const activatedEntries = getActivatedDictionary(
+      dictionary,
+      [ctx["<LOCATION>"], ctx["<ENTITIES>"], action],
+      { history: fullMessageHistory.map((m) => m.content) },
+    );
+    // Split by position into the two lorebook blocks. When the active prompt has no "before" chip, those entries
+    // fall back into the single "after" block so no lore is lost; a prompt with no dictionary chip at all gets a
+    // code append below (as before the chips existed).
+    const hasBeforeChip = systemPrompt.includes("<DICTIONARY|before>");
+    const hasAfterChip = systemPrompt.includes("<DICTIONARY>");
+    const beforeEntries = hasBeforeChip ? activatedEntries.filter((e) => e.position === "before") : [];
+    const afterEntries = activatedEntries.filter((e) => !beforeEntries.includes(e));
+
+    // Code-generated blocks (markdown guidance, notes fallback, dictionary) are authored in markdown, so
+    // restyle them to the active preset's section style to match the authored prompt's headers.
+    let updatedPrompt = renderPromptTemplate(systemPrompt, {
+      ...ctx,
+      "<LENGTH GUIDANCE>": lengthGuidance(paragraphLimit, maxTokens),
+      "<MARKDOWN GUIDANCE>": restyle(markdownGuidance(markdownOutput), activeSectionStyle),
+      "<DICTIONARY>": buildDictionaryContext(afterEntries, false) || NONE_PLACEHOLDER,
+      "<DICTIONARY|before>": buildDictionaryContext(beforeEntries, false) || NONE_PLACEHOLDER,
+    });
+
+    // If the prompt has no <NOTES> chip, fall back to a notes section before the location data.
+    if (!systemPrompt.includes("<NOTES>")) {
+      const notesSection = restyle(`
+## Player Notes
+${playerNotes || NONE_PLACEHOLDER}
+
+`, activeSectionStyle);
+      // Locate the location header in whichever style the active prompt uses.
+      const locationIndex = updatedPrompt.search(/^#{0,6}[ \t]*Current Location:?/mi);
+      if (locationIndex !== -1) {
+        updatedPrompt =
+          updatedPrompt.slice(0, locationIndex) +
+          notesSection +
+          updatedPrompt.slice(locationIndex);
+      }
+    }
+    setIsWaitingForAI(true);
+
+    if (language.toLowerCase() != "english")
+      updatedPrompt += `\n Narration language: ` + language;
+
+    // Backward-compat: a prompt with no "after" dictionary chip still gets its lore appended (with heading), as
+    // it was before the chip existed. (A missing "before" chip already routed those entries into `afterEntries`.)
+    if (!hasAfterChip) {
+      const dictionaryContext = buildDictionaryContext(afterEntries);
+      if (dictionaryContext) {
+        updatedPrompt += `\n\n${restyle(dictionaryContext, activeSectionStyle)}`;
+      }
+    }
+
+    // Get trimmed history before adding new action (history fills the window left by the prompt).
+    // Pass the action so banding can rehydrate older turns it references.
+    const trimmedHistory = getTrimmedMessageHistory(estimateTokens(updatedPrompt.length), action);
+
+    // One AbortController for the whole turn, so Stop aborts every sub-request — not just the active one.
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    const { signal } = controller;
+
+    try {
+      // Clear the box now (the action is captured in `action`), so anything the player types
+      // after choices unlock the box isn't wiped when the turn finishes.
+      setPlayerInput("");
+      setChoices([]);
+      setChoicesReady(false);
+      setSuggestedLocation(null);
+      // Stamp a stable id for this turn, written into its assistant JSON (powers the digest apply-guard).
+      currentTurnIdRef.current = crypto.randomUUID();
+      // Start a new turn in the AI-context history (cap to the last 50 turns).
+      setDebugTurns((prev) => [...prev, { action, requests: [], turnId: currentTurnIdRef.current }].slice(-50));
+
+      // Create message array for game text request
+      const narrationMessages: ChatMessage[] = [
+        ...trimmedHistory,
+        { role: "user", content: action === "START GAME" ? OPENING_SCENE_CUE : `Player action: ${action}` },
+      ];
+
+      // Add user message to history after getting trimmed history
+      addMessageToHistory("user", action);
+
+      // Optional thinking step (runs exactly once). 'precall' and 'staged' produce a hidden plan
+      // (captured in turnPlan and attached to the final user turn below); 'inline' appends a <think>
+      // directive to the game-text request (the reasoning is stripped before the player sees it).
+      let turnPlan = "";
+      // Staged-only candidates the narration confirms later: ad-hoc = director-invented (no entity
+      // record, strict match); director = defined entities the director cast (loose match, since the
+      // director already vouched they're present — "the tank" can confirm a "Battle Tank").
+      const adHocCandidates: string[] = [];
+      const directorCandidates: string[] = [];
+      if (thinkingMode === "precall") {
+        const thinkPrompt = renderPromptTemplate(thinkingPrompt, ctx);
+        // Frame the planning task as a single instruction. Reusing the narration message history
+        // (turns of action -> story) primes the model to just continue the story instead of planning.
+        // Banded turns ride as condensed pairs; the last assistant message is the recent floor turn's
+        // real narration, so pull it straight from history.
+        let lastStory =
+          [...trimmedHistory].reverse().find((m) => m.role === "assistant")?.content || "";
+        // Planning needs the least context: the immediate turn verbatim, everything older summarized.
+        // When banding is on, rebuild with a floor of 1 (no rehydration) so prior turns are all digests.
+        let digestBand = "";
+        if (memoryDigests) {
+          const planner = buildBandedHistory({
+            turns: parseTurns(fullMessageHistory),
+            contextWindow,
+            promptTokens: estimateTokens(thinkPrompt.length),
+            maxTokens: 256,
+            verbatimFloor: thinkingVerbatimTurns,
+            keywords: [],
+            actionEntities: [],
+            rehydrateCap: 0,
+            maxRehydrations: 0,
+          });
+          digestBand = planner.recap;
+          lastStory =
+            [...planner.messages].reverse().find((m) => m.role === "assistant")?.content || lastStory;
+        }
+        const thinkMessages: ChatMessage[] = [
+          {
+            role: "user",
+            content: `${digestBand ? `${digestBand}\n\n` : ""}${lastStory ? `What just happened:\n${lastStory}\n\n` : ""}The player's next action: ${action}\n\nWrite the brief plan now. Do not narrate.`,
+          },
+        ];
+        const plan = await makeAIRequest(thinkPrompt, thinkMessages, "thinking", 256, signal);
+        if (plan) turnPlan = plan;
+      } else if (thinkingMode === "inline") {
+        updatedPrompt += INLINE_THINKING_DIRECTIVE;
+      } else if (thinkingMode === "staged") {
+        // Staged planning: director (cast + continuation) -> one motivation pass per character
+        // (sequential, capped at 3) -> storyboarder. The storyboard is injected like the precall plan.
+        const stageValues = ctx;
+        // Banded turns ride as condensed pairs, so the last assistant message is the real last narration.
+        const lastStory =
+          [...trimmedHistory].reverse().find((m) => m.role === "assistant")?.content || "";
+        const staged = await runStagedPlanning({
+          action,
+          stageValues,
+          lastStory,
+          entities: allEntities,
+          presentEntityIds: withDiscovered(currentLocation)?.entities || [],
+          playerNames: playerTraits.map((t) => t.name),
+          characterDiaries,
+          fullMessageHistory,
+          diaryMemoryEntries: DIARY_MEMORY_ENTRIES,
+          caps: { director: DIRECTOR_MAX_TOKENS, character: CHARACTER_MAX_TOKENS, storyboard: STORYBOARD_MAX_TOKENS },
+          directorPrompt,
+          directorUserPrompt,
+          characterPrompt,
+          storyboardPrompt,
+          request: makeAIRequest,
+          signal,
+        });
+        if (signal.aborted) return;
+        turnPlan = staged.turnPlan;
+        directorCandidates.push(...staged.directorCandidates);
+        adHocCandidates.push(...staged.adHocCandidates);
+      }
+
+      // Attach the plan to the final user turn (adjacent to where the model writes) instead of the
+      // system prompt — keeps it salient and leaves the authored system prompt untouched. It rides as
+      // narrator stage-directions (see planDirective), kept distinct from the player's action above it.
+      if (turnPlan) {
+        narrationMessages[narrationMessages.length - 1].content += planDirective(turnPlan);
+      }
+
+      // Track the assembled system-prompt size for the memory-usage breakdown
+      setLastPromptChars(updatedPrompt.length);
+
+      // Get game text first since choices and stat updates depend on it
+      const narrationResponse = await makeAIRequest(
+        updatedPrompt,
+        narrationMessages,
+        "narration",
+        null,
+        signal,
+      );
+
+      // If the user stopped, or the request came back empty, bail (the `finally` resets waiting state).
+      if (signal.aborted || !narrationResponse) return;
+
+      // Who took part this turn: defined entities named in the narration, plus any staged ad-hoc
+      // characters the narration confirms (planning only suggests; the narration is the gate). Drives the
+      // entity tab, the choices filter, and stored participation.
+      const turnParticipants = [
+        ...new Set([
+          ...findEntityNames(narrationResponse, allEntities),
+          ...matchNamesLoose(narrationResponse, directorCandidates),
+          ...matchNames(narrationResponse, adHocCandidates),
+        ]),
+      ];
+      // Apply the authoritative set now (narration is done) — incl. staged ad-hoc, and without waiting on
+      // the trailing choices/stats/location requests. The streaming pass below kept it live per-sentence.
+      setVisibleEntities(turnParticipants);
+      // Bring-them-over: an authored character living in a reachable sibling that the narration named joins
+      // the current location as a visitor — anchored via the discovered-entity path, so it persists and
+      // rolls back with the turn. Affects the next turn's context (this turn's ctx already ran).
+      if (currentLocation) {
+        const visitors = selectReachableVisitors(
+          turnParticipants, currentLocation, locations, entities,
+          withDiscovered(currentLocation)?.entities ?? [],
+        );
+        if (visitors.length) {
+          const locId = currentLocation.id;
+          const turnId = currentTurnIdRef.current;
+          setDiscoveredEntities((prev) => {
+            const additions = visitors.filter(
+              (v) => !prev.some((d) => d.locationId === locId && sameCharacterName(d.entity.name, v.name)),
+            );
+            return additions.length
+              ? [...prev, ...additions.map((entity) => ({ entity, locationId: locId, sourceTurnId: turnId }))]
+              : prev;
+          });
+        }
+      }
+      // Choices should only see who's in the scene now — this turn's participants plus those from the
+      // prior turns in the rolling window — scoped to entities that exist at the location. Empty → the
+      // choices request gets no entity section (can't spoil/act for anyone not present).
+      const presentNames = new Set([
+        ...turnParticipants,
+        ...recentParticipants(fullMessageHistory, CHOICES_PRESENCE_TURNS - 1),
+      ]);
+      const sceneEntities = allEntities.filter((e) => presentNames.has(e.name));
+      const sceneLoc = withDiscovered(currentLocation);
+      const sceneEntityData = buildEntityContext(sceneLoc, sceneEntities);
+      const sceneEntitySummary = buildEntityContext(sceneLoc, sceneEntities, { preferSummary: true });
+      const sceneEntityDataMd = buildEntityContext(sceneLoc, sceneEntities, { format: "markdown" });
+      const sceneEntitySummaryMd = buildEntityContext(sceneLoc, sceneEntities, { preferSummary: true, format: "markdown" });
+
+      // Auto-narrate the new game text if a TTS model is loaded. When streaming is off, block the trailing
+      // choices/stat/location requests until the audio has finished generating (avoids GPU contention). When
+      // streaming is on, narration was already synthesized sentence-by-sentence during the request above.
+      if (ttsLoaded && !streamNarrationAudio) {
+        await generateTTS(narrationResponse);
+        if (signal.aborted) return; // player stopped during TTS generation
+      }
+
+      // Make choices and stat updates requests concurrently since they both only depend on game text
+      let choicesResponse = "";
+      let statUpdatesResponse = "";
+
+      // Only prepare and make choices request if enabled
+      if (choicesEnabled) {
+        let updatedChoicesPrompt = renderPromptTemplate(choicesPrompt, {
+          ...ctx,
+          // Choices see only who is actually in the scene, not the whole location roster — override every
+          // entity form so whichever the (editable) choices prompt uses gets the scene roster, not all present.
+          "<ENTITIES>": sceneEntityData,
+          "<ENTITIES|summary>": sceneEntitySummary,
+          "<ENTITIES|markdown>": sceneEntityDataMd,
+          "<ENTITIES|summary.markdown>": sceneEntitySummaryMd,
+        });
+
+        if (language.toLowerCase() != "english")
+          updatedChoicesPrompt += `\n Choice language: ` + language;
+
+        choicesResponse = await makeAIRequest(
+          updatedChoicesPrompt,
+          [
+            {
+              role: "user",
+              content: renderPromptTemplate(choicesUserPrompt, {
+                "<PLAYER ACTION>": action,
+                "<NARRATION>": narrationResponse,
+              }),
+            },
+          ],
+          "choices",
+          null,
+          signal,
+        );
+      }
+
+      if (signal.aborted) return; // stopped during the choices request
+      // Choices (the interactive part of the turn) are ready — let the player start composing their next
+      // action while stat-updates / location requests finish in the background.
+      setChoicesReady(true);
+
+      // Only prepare and make stat updates request if enabled and the world actually defines stats
+      // (otherwise the model hallucinates stat names that match nothing).
+      if (statUpdatesEnabled && playerStats.length > 0) {
+        let updatedStatUpdatesPrompt = renderPromptTemplate(statUpdatesPrompt, ctx);
+
+        if (language.toLowerCase() != "english")
+          updatedStatUpdatesPrompt += "\n Please write in english";
+
+        statUpdatesResponse = await makeAIRequest(
+          updatedStatUpdatesPrompt,
+          [
+            {
+              role: "user",
+              content: renderPromptTemplate(statUpdatesUserPrompt, {
+                "<PLAYER ACTION>": action,
+                "<NARRATION>": narrationResponse,
+              }),
+            },
+          ],
+          "statUpdates",
+          null,
+          signal,
+        );
+      }
+
+      if (signal.aborted) return; // stopped during the stat-updates request
+      // Ask the AI whether the player should move to a different location (v1.2.0)
+      if (locationChangeEnabled && locationChangePromptText) {
+        const updatedLocationPrompt = renderPromptTemplate(locationChangePromptText, ctx);
+
+        const locationResponse = await makeAIRequest(
+          updatedLocationPrompt,
+          [
+            {
+              role: "user",
+              content: renderPromptTemplate(locationChangeUserPrompt, {
+                "<PLAYER ACTION>": action,
+                "<NARRATION>": narrationResponse,
+              }),
+            },
+          ],
+          "locationChange",
+          null,
+          signal,
+        );
+
+        // Scope the router to the local navigable graph: match only against places reachable from here.
+        const destinations = navigableDestinations(currentLocation, locations);
+        const matchedName = matchLocationResponse(
+          locationResponse,
+          destinations.map((loc) => loc.name),
+        );
+        if (matchedName) {
+          const target = destinations.find((loc) => loc.name === matchedName);
+          if (target && target.id !== currentLocation?.id) {
+            if (locationAutoApply) {
+              changeLocation(target);
+              addLogEntry(`Moved to location: ${target.name}`);
+            } else {
+              setSuggestedLocation(target);
+            }
+          }
+        }
+      }
+
+      if (signal.aborted) return; // stopped during the location-change request
+      // Parse choices (line-separated), hard-capped to 6 to stop the AI over-producing
+      const choicesList = !choicesEnabled ? [] : parseChoices(choicesResponse);
+      setChoices(choicesList);
+
+      // Parse stat updates into current-value deltas and max-cap deltas (see lib/statChanges).
+      let statChanges: Record<string, number>[] = [];
+      if (statUpdatesEnabled && statUpdatesResponse) {
+        const { values, maxes } = parseStatUpdates(statUpdatesResponse);
+        statChanges = Object.entries(values).map(([k, v]) => ({ [k]: v }));
+        if (Object.keys(maxes).length > 0) {
+          // Max changes re-clamp the current value into the new range (lib handles the guards).
+          setPlayerStats((prevStats) => applyAiMaxChanges(prevStats, maxes));
+        }
+      }
+
+      // Update final assistant message with complete data
+      setFullMessageHistory((prev) => {
+        const updatedHistory = [...prev];
+        if (
+          updatedHistory.length > 0 &&
+          updatedHistory[updatedHistory.length - 1].role === "assistant"
+        ) {
+          updatedHistory[updatedHistory.length - 1] = {
+            role: "assistant",
+            content: JSON.stringify({
+              narration: narrationResponse,
+              choices: choicesList,
+              stat_changes: statChanges,
+              turnId: currentTurnIdRef.current,
+              entities: turnParticipants,
+              locationId: currentLocation?.id,
+            }),
+          };
+        }
+        return updatedHistory;
+      });
+
+      //setGameplayText(aiResponse.narration);
+      //setChoices(aiResponse.choices || []);
+
+      // Apply stat changes
+      if (statChanges.length > 0) {
+        applyStatChanges(statChanges);
+      }
+
+      // Default 1 hour passed per action
+      handleTimePassed(1);
+
+      // Snapshot this turn once the updates above commit (deferred so the snapshot captures the finalized
+      // message, applied stat changes, and advanced time rather than a stale mid-batch read).
+      armTurnSnapshot();
+
+      // Only set game as started after successful START GAME action
+      if (action === "START GAME") {
+        setIsGameStarted(true);
+      }
+    } catch (error) {
+      const err = error as { response?: { status?: number }; message?: string };
+      // Reset game started state if START GAME action fails
+      if (action === "START GAME") {
+        setIsGameStarted(false);
+      }
+
+      let errorMessage = "Failed to complete action. Please try again.";
+
+      // Handle specific error codes
+      if (err.response) {
+        if (err.response.status === 404) {
+          errorMessage =
+            "Request failed (404) Invalid endpoint URL or model name. Please check your settings.";
+        } else if (err.response.status === 400) {
+          errorMessage =
+            "Request failed (400). Either model name is wrong or memory limit exceeded model limit.";
+        }
+      }
+      // Handle JSON parse errors
+      else if (err.message === "Unable to parse input") {
+        errorMessage =
+          "The AI model was unable to produce the correct JSON format. Try a different model.";
+      }
+
+      toast.error(errorMessage, {
+        position: "top-right",
+        autoClose: 3000,
+        hideProgressBar: false,
+        closeOnClick: true,
+        pauseOnHover: true,
+        draggable: true,
+      });
+      addLogEntry(errorMessage);
+    } finally {
+      setIsWaitingForAI(false);
+      setAiRequestType(null);
+      // Release the turn's controller (unless a newer turn already replaced it).
+      if (abortControllerRef.current === controller) abortControllerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    const startIndex = (currentPage - 1) * messagesPerPage;
+    const endIndex = startIndex + messagesPerPage;
+    setDisplayedMessages(fullMessageHistory.slice(startIndex, endIndex));
+  }, [fullMessageHistory, currentPage, setDisplayedMessages]);
+
+  useEffect(() => {
+    // Move to the last page whenever we receive new AI game text
+    setCurrentPage(Math.ceil(fullMessageHistory.length / messagesPerPage));
+  }, [fullMessageHistory.length, messagesPerPage, setCurrentPage]);
+
+  // Fires the re-send half of a re-generate, once the restored pre-turn state has committed.
+  useEffect(() => {
+    if (regenerateNonce === 0) return;
+    const action = pendingRegenerateRef.current;
+    pendingRegenerateRef.current = null;
+    if (action !== null) sendGameAction(action);
+    // sendGameAction is deliberately not a dependency — we want this render's (post-restore) closure.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [regenerateNonce]);
+
+  const handlePageChange = (page: number) => {
+    setCurrentPage(page);
+  };
+
+  const totalPages = Math.ceil(fullMessageHistory.length / messagesPerPage);
+
+  // Latest committed stats, so off-render derivations (below) don't rely on a stale closure.
+  const playerStatsRef = useRef(playerStats);
+  playerStatsRef.current = playerStats;
+  // Pending "clear recent changes" timer, tracked so a new turn or unmount can cancel it.
+  const recentStatTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (recentStatTimerRef.current) clearTimeout(recentStatTimerRef.current);
+    },
+    [],
+  );
+
+  // Update the applyStatChanges function to handle specific stat updates
+  const applyStatChanges = useCallback(
+    // `base` overrides the starting stats (defaults to the live ref) — a stat re-generation applies the
+    // fresh deltas onto the pre-turn baseline so repeated re-rolls don't stack on already-applied changes.
+    async (changes: Record<string, number>[], affectedStats: string[] | null = null, base: typeof playerStats | null = null) => {
+      // Merge the AI's change objects into one normalized (name→delta) map.
+      const normalizedChanges = normalizeStatChanges(changes);
+
+      // Surface the changes, then clear the highlight after 10s. Cancel any prior timer first so a
+      // stale clear can't wipe a newer turn's changes.
+      setRecentStatChanges(normalizedChanges);
+      if (recentStatTimerRef.current) clearTimeout(recentStatTimerRef.current);
+      recentStatTimerRef.current = setTimeout(() => setRecentStatChanges({}), 10000);
+
+      // Apply the AI's direct changes, then derive any code-based stats from that result. Both run
+      // outside the state updater (updaters must stay pure), reading the latest stats via the ref.
+      const directApplied = applyAiStatChanges(base ?? playerStatsRef.current, normalizedChanges, affectedStats);
+      setPlayerStats(directApplied);
+      try {
+        // processStatCode is typed over Stat[]; playerStats is the narrower PlayerStat[] (value: number).
+        const coded = await processStatCode(directApplied);
+        if (coded !== directApplied) setPlayerStats(coded as typeof playerStats);
+      } catch (error) {
+        console.error("Error processing stat code after changes:", error);
+      }
+    },
+    [setPlayerStats, setRecentStatChanges],
+  );
+
+  // Function to abort ongoing AI generation
+  const abortGeneration = () => {
+    if (!abortControllerRef.current) return;
+    abortControllerRef.current.abort();
+    abortControllerRef.current = null;
+
+    setIsWaitingForAI(false);
+    setAiRequestType(null);
+    setChoicesReady(false);
+
+    const last = fullMessageHistory[fullMessageHistory.length - 1];
+    if (last?.role === "assistant") {
+      // Narration came through — keep this turn so the player can stop here and edit it manually. A kept
+      // narration means the game is underway (covers aborting the opening turn). Save a snapshot so
+      // gameStates stays aligned with history (rollback / re-generate key off the page count).
+      setIsGameStarted(true);
+      // Event-handler context: saveCurrentGameState reads the latest committed state, and the kept
+      // narration already landed during streaming — so a synchronous snapshot here is fresh. Index it by
+      // its own history length to keep gameStates aligned (same rule as the normal post-turn save).
+      const snapshot = { ...saveCurrentGameState(), isGameStarted: true };
+      const pageIndex = snapshotPageIndex(snapshot.fullMessageHistory?.length ?? 0, messagesPerPage);
+      setGameStates((prev) => placeSnapshot(prev, pageIndex, snapshot));
+    } else if (last?.role === "user") {
+      // Nothing came back — drop the lone, unpaired user message (it would corrupt history pairing) and
+      // restore the previous turn's choices, which were cleared when this turn started.
+      setFullMessageHistory((prev) => prev.slice(0, -1));
+      // This turn never made it into the context; flag it so the AI-context viewer can hide it.
+      setDebugTurns((prev) => {
+        if (!prev.length) return prev;
+        const next = prev.slice();
+        next[next.length - 1] = { ...next[next.length - 1], aborted: true };
+        return next;
+      });
+      const previous = fullMessageHistory[fullMessageHistory.length - 2];
+      let restored: string[] = [];
+      if (previous?.role === "assistant") {
+        try {
+          const parsed = JSON.parse(previous.content);
+          if (Array.isArray(parsed.choices)) restored = parsed.choices;
+        } catch {
+          restored = [];
+        }
+      }
+      setChoices(restored);
+    }
+
+    addLogEntry("AI generation aborted");
+  };
+
+  const makeAIRequest = async (
+    systemPrompt: string,
+    messages: ChatMessage[],
+    requestType: AIRequestType = "narration",
+    maxTokensOverride: number | null = null,
+    signal?: AbortSignal,
+    // Silent requests (the memory digest) run without UI noise: no "Generating…" label, and they
+    // surface in the status bar / AI-context viewer only when the "Show Silent Requests" setting is on.
+    // When captured, they attach to the turn named by `attachTurnId` (the turn the digest summarizes —
+    // usually the one just committed, or an older turn when backfilling), so the viewer shows the
+    // request under the right turn rather than whatever turn happens to be current.
+    silent = false,
+    attachTurnId?: string,
+  ) => {
+    // Silent requests are only captured into the AI-context viewer when the inspection toggle is on.
+    const captureSilent = silent && showSilentRequests && attachTurnId !== undefined;
+    // Append a captured request payload onto the matching debug turn (the current turn for foreground
+    // requests, or the `attachTurnId` turn for a silent digest). No-op if that turn isn't found.
+    const captureRequest = () => setDebugTurns((prev) => {
+      if (!prev.length) return prev;
+      const idx = silent ? prev.findIndex((t) => t.turnId === attachTurnId) : prev.length - 1;
+      if (idx === -1) return prev;
+      const next = prev.slice();
+      next[idx] = {
+        ...next[idx],
+        requests: [
+          ...next[idx].requests,
+          { type: requestType, messages: [{ role: "system", content: systemPrompt }, ...messages] },
+        ],
+      };
+      return next;
+    });
+
+    try {
+      // Surface which request is currently running (silent requests use the digest status indicator instead).
+      if (!silent) setAiRequestType(requestType);
+
+      // Capture the exact payload into the AI-context viewer.
+      if (!silent || captureSilent) captureRequest();
+
+      const response = await fetch(getEndpointUrl(), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiToken}`,
+        },
+        body: JSON.stringify({
+          model: modelName,
+          messages: [{ role: "system", content: systemPrompt }, ...messages],
+          max_tokens: maxTokensOverride ?? maxTokens,
+          stream: true,
+          // Single-paragraph stop, but not in inline-thinking mode — the <think> block needs newlines.
+          ...(requestType === "narration" && paragraphLimit === "single" && thinkingMode !== "inline" && { stop: ["\n"] }),
+        }),
+        signal, // Add the abort signal to the fetch request
+      });
+
+      if (!response.ok) {
+        const error = new Error("HTTP error") as Error & { response?: Response };
+        error.response = response;
+        throw error;
+      }
+
+      if (!response.body) throw new Error("Response has no body to stream");
+      const reader = response.body.getReader();
+      // Unblock a pending read the instant the turn is aborted, so we stop consuming immediately even if
+      // the server keeps streaming after we disconnect. `once` lets it clean itself up.
+      signal?.addEventListener("abort", () => { reader.cancel().catch(() => {}); }, { once: true });
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let content = "";
+      let finishReason = null;
+      // Start a fresh smoothed reveal for this turn's narration.
+      if (requestType === "narration") { reveal.reset(); entitySentenceCursorRef.current = 0; assistantAddedRef.current = false; }
+      // Opt-in streaming TTS: synthesize narration sentence-by-sentence as it arrives (needs a model).
+      const ttsStreaming = streamNarrationAudio && ttsLoaded && requestType === "narration";
+      if (ttsStreaming) { ttsModalRef.current?.streamStart(); ttsSentenceCursorRef.current = 0; }
+
+      // Handle one complete SSE line. Lines are buffered across reads (below) so a `data:` payload
+      // split across network chunks is never JSON.parsed half-formed.
+      const processLine = (sseLine: string) => {
+        if (!sseLine.startsWith("data: ")) return;
+        const data = sseLine.slice(6);
+        if (data === "[DONE]") return;
+        try {
+          const parsed = JSON.parse(data);
+          const delta = parsed.choices[0]?.delta?.content || "";
+          content += delta;
+          if (parsed.choices[0]?.finish_reason) {
+            finishReason = parsed.choices[0].finish_reason;
+          }
+
+          // Handle different request types
+          if (requestType === "narration") {
+            // Feed the full (reasoning-stripped) content; the smoothed reveal trails it so the
+            // display reads as continuous typing and the late truncation trim stays off-screen.
+            const display = stripReasoningLive(content);
+            reveal.push(display);
+            // Split once per token; both streaming TTS and the entity tab read the same segments.
+            const segments = splitSentenceSegments(display);
+
+            // Feed newly-completed sentences to streaming TTS, holding back the last (in-progress) one.
+            if (ttsStreaming) {
+              const completeCount = segments.length - 1;
+              for (let i = ttsSentenceCursorRef.current; i < completeCount; i++) {
+                ttsModalRef.current?.streamSentence(segments[i]);
+              }
+              if (completeCount > ttsSentenceCursorRef.current) ttsSentenceCursorRef.current = completeCount;
+            }
+
+            // Progressively fill the entity tab as each sentence completes (defined entities only; the
+            // authoritative union, incl. staged ad-hoc, is applied once the narration finishes).
+            const completeSentences = segments.length - 1;
+            const newSentence = completeSentences > entitySentenceCursorRef.current;
+            if (newSentence) {
+              entitySentenceCursorRef.current = completeSentences;
+              setVisibleEntities(findEntityNames(display, allEntities));
+            }
+
+            // Persist the in-progress assistant message: add it once (as soon as narration content
+            // arrives — so an abort before any text still drops the lone user turn), then refresh it only
+            // on sentence boundaries. Writing it every token re-renders the whole app and copies the
+            // history array per token, which compounds as history grows and starves the streaming reveal.
+            // The visible narration comes from the smoothed reveal (gameplayText), not this message, and
+            // the final text is committed once the turn finishes.
+            const shouldPersist = assistantAddedRef.current ? newSentence : display.length > 0;
+            if (shouldPersist) {
+              assistantAddedRef.current = true;
+              const message = {
+                role: "assistant" as const,
+                content: JSON.stringify({
+                  narration: display,
+                  choices: [],
+                  stat_changes: [],
+                  turnId: currentTurnIdRef.current,
+                }),
+              };
+              setFullMessageHistory((prev) => {
+                if (prev.length > 0 && prev[prev.length - 1].role === "assistant") {
+                  const updatedHistory = [...prev];
+                  updatedHistory[updatedHistory.length - 1] = message;
+                  return updatedHistory;
+                }
+                return [...prev, message];
+              });
+            }
+          } else if (requestType === "choices") {
+            // Update choices in real-time, ensuring we handle partial content correctly
+            const choicesList = parseChoices(stripReasoningLive(content));
+            if (choicesList.length > 0) {
+              setChoices(choicesList);
+            }
+          }
+          // For statUpdates type, we do nothing during streaming
+        } catch (e) {
+          console.error("Error parsing streaming response:", e);
+        }
+      };
+
+      while (true) {
+        if (signal?.aborted) break; // user pressed Stop — quit consuming, even with chunks still buffered
+        const { done, value } = await reader.read();
+        if (done) break;
+        // Accumulate decoded text and dispatch only complete lines; the trailing partial line (and
+        // any partial multi-byte char, via { stream: true }) is carried into the next read.
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? "";
+        for (const line of lines) processLine(line);
+      }
+      // Aborted mid-stream: drop everything received this turn and don't commit it.
+      if (signal?.aborted) {
+        if (requestType === "narration") reveal.reset();
+        if (ttsStreaming) ttsModalRef.current?.streamCancel();
+        return "";
+      }
+      // Flush the decoder and process a final line that arrived without a trailing newline.
+      buffer += decoder.decode();
+      if (buffer.trim()) processLine(buffer.trim());
+
+      // Show the raw output (including any <think> block) in the AI-context viewer, but return the
+      // cleaned text so reasoning never reaches the narration, TTS, choices/stats/location, or history.
+      const rawContent = content.trim();
+      let finalContent = stripReasoning(content).trim();
+      // On a mid-sentence truncation (hit the token cap), trim back to the last complete sentence.
+      if (requestType === "narration") {
+        if (finishReason === "length") finalContent = trimToLastSentence(finalContent);
+        // Hand the authoritative final text to the smoothed reveal to play out cleanly.
+        reveal.finish(finalContent);
+        // Flush any sentence(s) still unsent (incl. a final one with no trailing terminator), then end.
+        if (ttsStreaming) {
+          const segments = splitSentenceSegments(finalContent);
+          for (let i = ttsSentenceCursorRef.current; i < segments.length; i++) {
+            ttsModalRef.current?.streamSentence(segments[i]);
+          }
+          ttsModalRef.current?.streamEnd();
+        }
+      }
+      // Record the raw output on this turn's matching request so the AI-context viewer can show it
+      // (silent digests record onto the turn they summarize, mirroring captureRequest above).
+      if (!silent || captureSilent) setDebugTurns((prev) => {
+        if (!prev.length) return prev;
+        const idx = silent ? prev.findIndex((t) => t.turnId === attachTurnId) : prev.length - 1;
+        if (idx === -1) return prev;
+        const next = prev.slice();
+        const turn = { ...next[idx] };
+        turn.requests = turn.requests.map((r) =>
+          r.type === requestType && r.response === undefined
+            ? { ...r, response: rawContent }
+            : r,
+        );
+        next[idx] = turn;
+        return next;
+      });
+      return finalContent;
+    } catch (error) {
+      // Check if this is an abort error (user canceled the request)
+      if ((error as Error).name === "AbortError") {
+        if (requestType === "narration") { reveal.reset(); }
+        if (streamNarrationAudio && ttsLoaded && requestType === "narration") ttsModalRef.current?.streamCancel();
+        // Return empty content for aborted requests instead of throwing
+        return "";
+      }
+
+      console.error("Error in makeAIRequest:", error);
+      // A failed silent request (the digest) is non-fatal — let the drainer swallow it without a toast.
+      if (silent) throw error;
+      toast.error("Failed to process AI request");
+      throw error;
+    }
+  };
+
+  // Hold the latest makeAIRequest so the digest drainer always calls a fresh closure without
+  // re-running its effect every render (makeAIRequest is rebuilt each render by design).
+  const makeAIRequestRef = useRef(makeAIRequest);
+  makeAIRequestRef.current = makeAIRequest;
+
+  // DEV-only: expose window.__baseline for the fork-local test harness (no-op in production builds).
+  const debugTurnsRef = useRef(debugTurns);
+  debugTurnsRef.current = debugTurns;
+  const sendGameActionRef = useRef(sendGameAction);
+  sendGameActionRef.current = sendGameAction;
+  useBaselineTestHook(debugTurnsRef, sendGameActionRef);
+
+  // Memory-digest drainer: summarize each completed turn silently (serialized, one at a time) and
+  // patch the digest back onto that turn. Only runs while idle (just after a turn commits) so it never
+  // contends with the active turn's requests. Patching the history re-runs this effect, which picks up
+  // the next due turn until none remain (also backfills older turns when first enabled mid-game).
+  useEffect(() => {
+    if (!memoryDigests || isWaitingForAI || digestDrainingRef.current) return;
+    const due = selectDueDigests(fullMessageHistory);
+    if (due.length === 0) return;
+    // Oldest due turn first — it's closest to leaving the context window (matters when backfilling).
+    const turnId = due[due.length - 1];
+    const idx = fullMessageHistory.findIndex(
+      (m) => m.role === "assistant" && parseTurnContent(m.content)?.turnId === turnId,
+    );
+    const narrationText = idx >= 0 ? parseTurnContent(fullMessageHistory[idx].content)?.narration ?? "" : "";
+    if (!narrationText.trim()) return;
+    // The digest runs on an aged-out turn, so its action is the paired user message (as parseTurns pairs them).
+    const playerAction = idx > 0 && fullMessageHistory[idx - 1].role === "user" ? fullMessageHistory[idx - 1].content : "";
+
+    digestDrainingRef.current = true;
+    setDigestActive(true);
+    (async () => {
+      try {
+        const digest = await makeAIRequestRef.current(
+          renderPromptTemplate(summaryPrompt, buildContextValues()),
+          [{ role: "user", content: renderPromptTemplate(summaryUserPrompt, { "<PLAYER ACTION>": playerAction, "<NARRATION>": narrationText }) }],
+          "summary",
+          DIGEST_MAX_TOKENS,
+          undefined,
+          true, // silent: no "Generating…" label; surfaces only when "Show Silent Requests" is on
+          turnId, // attach the request to the turn it summarizes in the AI-context viewer
+        );
+        const trimmed = (digest ?? "").trim();
+        if (trimmed) setFullMessageHistory((prev) => applyDigest(prev, turnId, trimmed) ?? prev);
+      } catch {
+        // Non-fatal: the turn stays due and is retried on a later idle tick.
+      } finally {
+        digestDrainingRef.current = false;
+        setDigestActive(false);
+      }
+    })();
+  }, [memoryDigests, isWaitingForAI, fullMessageHistory, summaryPrompt, summaryUserPrompt, buildContextValues, setFullMessageHistory]);
+
+  // Character-diary drainer (write side): for each completed turn with participants, silently write a
+  // first-person diary entry per participant as an idle-time job, patched back onto that turn's `diaries`
+  // map. Mirrors the digest drainer, and serializes against it (only one silent job runs at a time) so a
+  // local endpoint isn't hit twice. Runs one participant per tick; patching re-runs the effect until the
+  // due turn is fully covered, then the next due turn. Nothing consumes the entries yet (Slice A).
+  useEffect(() => {
+    if (!characterDiaries || isWaitingForAI || digestActive || discoverActive || digestDrainingRef.current || diaryDrainingRef.current || discoverDrainingRef.current) return;
+    const due = selectDueDiaries(fullMessageHistory);
+    if (due.length === 0) return;
+    // Oldest due turn first — closest to leaving the context window.
+    const turnId = due[due.length - 1];
+    const dueTurn = fullMessageHistory
+      .map((m) => (m.role === "assistant" ? parseTurnContent(m.content) : null))
+      .find((c) => c?.turnId === turnId);
+    const narrationText = dueTurn?.narration ?? "";
+    const name = pendingDiaryNames(fullMessageHistory, turnId)[0];
+    if (!narrationText.trim() || !name) return;
+    const entity = allEntities.find((e) => e.name.trim().toLowerCase() === name.trim().toLowerCase());
+
+    diaryDrainingRef.current = true;
+    setDiaryActive(true);
+    (async () => {
+      try {
+        const entry = await makeAIRequestRef.current(
+          renderPromptTemplate(diaryPrompt, buildContextValues()),
+          [{ role: "user", content: buildDiaryUserMessage({ name, entity, narration: narrationText }) }],
+          "diary",
+          DIARY_MAX_TOKENS,
+          undefined,
+          true, // silent: surfaces only when "Show Silent Requests" is on
+          turnId, // attach the request to the turn it records in the AI-context viewer
+        );
+        const trimmed = (entry ?? "").trim();
+        // Store even an empty result (as "") so the participant isn't retried forever on a blank reply.
+        setFullMessageHistory((prev) => applyDiary(prev, turnId, name, trimmed) ?? prev);
+      } catch {
+        // Non-fatal: the participant stays due and is retried on a later idle tick.
+      } finally {
+        diaryDrainingRef.current = false;
+        setDiaryActive(false);
+      }
+    })();
+  }, [characterDiaries, isWaitingForAI, digestActive, discoverActive, fullMessageHistory, allEntities, diaryPrompt, buildContextValues, setFullMessageHistory]);
+
+  // Runtime characters (Slice 2): promote a director-invented, narration-confirmed character into a
+  // persisted entity. Idle-gated and serialized like the diary drainer (shares the Character Diaries
+  // toggle); runs before the diary pass so a new character is described first. A confirmed participant
+  // whose name matches no known entity is silently described (3rd-person, from the turn's narration) and
+  // materialized into `discoveredEntities`, after which it flows through the authored-entity path.
+  useEffect(() => {
+    if (!characterDiaries || isWaitingForAI || digestActive || diaryActive || digestDrainingRef.current || diaryDrainingRef.current || discoverDrainingRef.current) return;
+    const knownNames = allEntities.map((e) => e.name);
+    const due = selectDueDiscovery(fullMessageHistory, knownNames);
+    if (!due) return;
+    const locationId = due.locationId ?? currentLocation?.id;
+
+    discoverDrainingRef.current = true;
+    setDiscoverActive(true);
+    (async () => {
+      try {
+        const description = await makeAIRequestRef.current(
+          defaultDiscoverEntityPrompt,
+          [{ role: "user", content: `${DISCOVER_NAME_LABEL} ${due.name}\n\n${DISCOVER_PASSAGE_LABEL}\n${due.narration}` }],
+          "discoverEntity",
+          DISCOVER_MAX_TOKENS,
+          undefined,
+          true, // silent: surfaces only when "Show Silent Requests" is on
+          due.turnId, // attach the request to the turn that introduced the character
+        );
+        // Small models parrot the prompt labels and get token-capped mid-word — sanitize before storing.
+        const cleaned = cleanDiscoveredDescription(description ?? "", due.name);
+        if (!cleaned) return; // no usable description — leave it due, retry on a later idle tick
+        const entity = materializeDiscoveredEntity(due.name, cleaned);
+        setDiscoveredEntities((prev) =>
+          // Guard against a double-add if the effect re-ran before state committed (variant-aware).
+          prev.some((d) => sameCharacterName(d.entity.name, due.name))
+            ? prev
+            : [...prev, { entity, locationId, sourceTurnId: due.turnId }],
+        );
+      } catch {
+        // Non-fatal: the character stays due and is retried on a later idle tick.
+      } finally {
+        discoverDrainingRef.current = false;
+        setDiscoverActive(false);
+      }
+    })();
+  }, [characterDiaries, isWaitingForAI, digestActive, diaryActive, fullMessageHistory, allEntities, currentLocation, setDiscoveredEntities]);
+
+  const handleSendAction = () => {
+    const input = playerInput.trim();
+    if (!input || isWaitingForAI) return;
+    if (input.startsWith("/")) {
+      runSlashCommand(input);
+      setPlayerInput("");
+      return;
+    }
+    sendGameAction(input);
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !isWaitingForAI) {
+      handleSendAction();
+    }
+  };
+
+  const handleStatChanges = useCallback(
+    (statChanges: StatChange[]) => {
+      // Runtime-only: apply to playerStats. The authored world (GameData.stats) is never mutated by play.
+      setPlayerStats((prevStats) => applyTraitStatChanges(prevStats, statChanges).stats);
+    },
+    [setPlayerStats],
+  );
+
+  const applyTrait = useCallback(
+    (trait: Trait) => {
+      handleStatChanges(trait.statChanges);
+      setPlayerTraits((prevTraits) => [...prevTraits, trait]);
+      addLogEntry(`Applied trait: ${trait.name}`);
+    },
+    [handleStatChanges, addLogEntry, setPlayerTraits],
+  );
+
+  const changeLocation = useCallback(
+    (newLocation: GameLocation) => {
+      setCurrentLocation(newLocation);
+
+      if (newLocation.ambientSound) {
+        setAmbientSound(newLocation.ambientSound);
+      } else {
+        setAmbientSound(null);
+      }
+    },
+    [setCurrentLocation],
+  );
+
+  useEffect(() => {
+    setPlayerStats(
+      stats.map((stat) => ({ ...stat, value: (stat.value as number) || stat.min || 0 })),
+    );
+  }, [stats, setPlayerStats]);
+
+  const isInitialized = useRef(false);
+
+  useEffect(() => {
+    if (!isInitialized.current && locations.length > 0) {
+      isInitialized.current = true;
+
+      initialTraits.forEach((traitId) => {
+        const trait = traits.find((t) => t.id === traitId);
+        if (trait) {
+          applyTrait(trait);
+        }
+      });
+
+      // Use the player's chosen starting location, else a random starting point (fallback: any location).
+      const location = resolveStartingLocation(locations, initialLocationId);
+      if (location) {
+        changeLocation(location);
+        addLogEntry(`Starting in location: ${location.name}`);
+      }
+
+      // Seed the per-playthrough dictionary set: the entry-step selection, or the world's authored books
+      // when the step was skipped. A loaded save overrides this later via loadGame.
+      setRuntimeDictionaries(initialDictionaries ?? dictionaries);
+
+      // Seed the entry-step characters into the starting location as runtime-only entities (never written
+      // to the authored world). They flow through the existing discovered-entity path; loadGame overrides.
+      if (location && initialCharacters && initialCharacters.length > 0) {
+        setDiscoveredEntities(
+          initialCharacters.map((entity) => ({ entity, locationId: location.id, sourceTurnId: 'initial' })),
+        );
+      }
+    }
+  }, [
+    initialTraits,
+    initialLocationId,
+    initialDictionaries,
+    initialCharacters,
+    dictionaries,
+    traits,
+    locations,
+    applyTrait,
+    changeLocation,
+    addLogEntry,
+    setRuntimeDictionaries,
+    setDiscoveredEntities,
+  ]);
+
+  const scrollToBottom = useCallback(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logsEndRef]);
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [logEntries, scrollToBottom]);
+
+  // Handle BGM playback
+  useEffect(() => {
+    if (bgmEnabled && worldOverview?.bgm) {
+      const bgmAudio = new Audio(worldOverview.bgm);
+      bgmAudio.loop = true;
+      bgmAudio.play();
+      return () => bgmAudio.pause();
+    }
+  }, [bgmEnabled, worldOverview]);
+
+  // Handle ambient sound playback
+  useEffect(() => {
+    if (ambientSound) {
+      const audio = new Audio(ambientSound.data);
+      audio.loop = true;
+      audio.play();
+      return () => audio.pause();
+    }
+  }, [ambientSound]);
+
+  // Extract the displayed narration from an assistant message (see lib/aiResponse).
+  const parseAssistantMessage = parseNarration;
+
+  // Status line shown above the input while a turn is being generated, naming the current AI
+  // request (Narration / Choices / Stat Updates / Location) so the player knows what's processing.
+  const progressBar = (() => {
+    // The active turn's request takes the status row; a silent memory digest (which runs between turns)
+    // shows here too when no turn is in flight, but only when "Show Silent Requests" is enabled.
+    if (isWaitingForAI) {
+      const labels = {
+        thinking: "Plan",
+        director: "Cast",
+        character: "Motivation",
+        storyboard: "Storyboard",
+        narration: "Narration",
+        choices: "Choices",
+        statUpdates: "Stat Updates",
+        locationChange: "Location",
+        summary: "Memory",
+        diary: "Diary",
+        discoverEntity: "Character",
+      };
+      const label = aiRequestType ? labels[aiRequestType] : "Response";
+      return (
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-xs text-muted-foreground whitespace-nowrap">
+            Generating {label}…
+          </span>
+          <div className="flex-grow">
+            <IndeterminateProgress />
+          </div>
+        </div>
+      );
+    }
+    if (digestActive && showSilentRequests) {
+      return (
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-xs text-muted-foreground whitespace-nowrap">
+            Summarizing turn…
+          </span>
+          <div className="flex-grow">
+            <IndeterminateProgress />
+          </div>
+        </div>
+      );
+    }
+    if (diaryActive && showSilentRequests) {
+      return (
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-xs text-muted-foreground whitespace-nowrap">
+            Writing diary…
+          </span>
+          <div className="flex-grow">
+            <IndeterminateProgress />
+          </div>
+        </div>
+      );
+    }
+    return null;
+  })();
+
+  // The context meter's history math is O(turns) (parseTurns + banding), so memoize it: the streaming
+  // reveal re-renders this component ~60×/sec (setGameplayText per frame), and recomputing per frame
+  // starves the reveal at high turn counts. This recomputes only when the history/settings that feed
+  // getTrimmedMessageHistory change (a few times per turn), not on every reveal frame.
+  const memoryStats = useMemo(() => {
+    const promptTokens = estimateTokens(lastPromptChars);
+    const trimmed = getTrimmedMessageHistory(promptTokens);
+    return {
+      promptTokens,
+      trimmed,
+      bandCounts: lastBandCountsRef.current, // set as a side effect of the call above
+      historyTokens: estimateTokens(estimateHistoryChars(trimmed)),
+    };
+  }, [getTrimmedMessageHistory, lastPromptChars]);
+
+  const memoryBar = (() => {
+    // Token breakdown of the model's context window: prompt + history + reserved output vs the window.
+    const windowTokens = contextWindow || 1;
+    const { promptTokens, trimmed, bandCounts, historyTokens } = memoryStats;
+    const outputTokens = maxTokens;
+    const usedTokens = promptTokens + historyTokens + outputTokens;
+    const pct = (n: number) => (n / windowTokens) * 100;
+    const usedPct = pct(usedTokens);
+    const availableTokens = Math.max(0, windowTokens - usedTokens);
+    const fillPct = Math.min(100, usedPct);
+    const barColor =
+      usedPct >= 90
+        ? "bg-destructive"
+        : usedPct >= 70
+          ? "bg-warning"
+          : "bg-success";
+    const row = (label: string, tokens: number) => (
+      <div className="flex justify-between"><span>{label}:</span><span>{tokens.toLocaleString()} tok ({pct(tokens).toFixed(0)}%)</span></div>
+    );
+    return (
+      <div className="flex items-center gap-2 mb-1 portrait:justify-center">
+        <Popover>
+          <PopoverTrigger asChild>
+            <button
+              className="text-muted-foreground hover:text-foreground flex items-center gap-1"
+              title="Memory usage"
+            >
+              <Database className="h-4 w-4" />
+              <span className="text-xs hidden portrait:inline font-medium">
+                {usedPct.toFixed(0)}%
+              </span>
+            </button>
+          </PopoverTrigger>
+          <PopoverContent align="start" className="w-64 text-xs space-y-1">
+            <div className="font-semibold">Context window: {windowTokens.toLocaleString()} tok</div>
+            {row("Prompt", promptTokens)}
+            {row("History", historyTokens)}
+            {bandCounts && (
+              <div className="pl-3 text-muted-foreground space-y-0.5">
+                {row("Summary band", bandCounts.bandTokens)}
+                {row("Rehydrated", bandCounts.rehydratedTokens)}
+              </div>
+            )}
+            {row("Reserved output", outputTokens)}
+            <div className="flex justify-between font-medium"><span>Available:</span><span>{availableTokens.toLocaleString()} tok ({Math.max(0, 100 - usedPct).toFixed(0)}%)</span></div>
+            {bandCounts ? (
+              // Banding keeps every turn — verbatim or folded into the digest band — so frame it as
+              // "full vs digested", not "kept vs lost". Dropped only shows if a turn truly fell off.
+              <div className="flex justify-between">
+                <span>Turns:</span>
+                <span>
+                  {bandCounts.turnsTotal} ({bandCounts.turnsVerbatim} full, {bandCounts.turnsBanded} summarized
+                  {bandCounts.turnsTotal - bandCounts.turnsVerbatim - bandCounts.turnsBanded > 0
+                    ? `, ${bandCounts.turnsTotal - bandCounts.turnsVerbatim - bandCounts.turnsBanded} dropped`
+                    : ""})
+                </span>
+              </div>
+            ) : (
+              <div className="flex justify-between"><span>Turns kept:</span><span>{Math.floor(trimmed.length / 2)} / {Math.floor(fullMessageHistory.length / 2)}</span></div>
+            )}
+          </PopoverContent>
+        </Popover>
+        <div className="flex-grow h-2 rounded-full bg-muted/70 overflow-hidden portrait:hidden">
+          <div
+            className={`h-full ${barColor} transition-all`}
+            style={{ width: `${fillPct}%` }}
+          />
+        </div>
+      </div>
+    );
+  })();
+
+  // AI location-change suggestion (rendered at the bottom of the center panel, above pagination).
+  const locationSuggestion = suggestedLocation ? (
+    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-30 flex items-center justify-center gap-2 whitespace-nowrap rounded-md border bg-background px-3 py-2 text-sm shadow-lg">
+      <span>
+        Move to <b>{suggestedLocation.name}</b>?
+      </span>
+      <Button
+        size="sm"
+        onClick={() => {
+          changeLocation(suggestedLocation);
+          addLogEntry(`Moved to location: ${suggestedLocation.name}`);
+          setSuggestedLocation(null);
+        }}
+      >
+        Go
+      </Button>
+      <Button
+        size="sm"
+        variant="ghost"
+        onClick={() => setSuggestedLocation(null)}
+      >
+        Dismiss
+      </Button>
+    </div>
+  ) : null;
+
+  const leftPanel = (
+    <LeftPanel
+      entities={entities}
+      onEntityClick={(entityId) => {
+        setSelectedEntity(entityId);
+        setIsEntityModalOpen(true);
+      }}
+    />
+  );
+
+  const middlePanel = (
+    <MiddlePanel
+      parseAssistantMessage={parseAssistantMessage}
+      totalPages={totalPages}
+      handlePageChange={handlePageChange}
+      sendGameAction={sendGameAction}
+      handleSendAction={handleSendAction}
+      handleKeyPress={handleKeyPress}
+      handleRollback={handleRollback}
+      handleRegenerate={handleRegenerate}
+      handleRegenerateChoices={handleRegenerateChoices}
+      handleRegenerateStats={handleRegenerateStats}
+      abortGeneration={abortGeneration}
+      disabled={isWaitingForAI && !choicesReady}
+      onTTSClick={() => setIsTTSModalOpen(true)}
+      onExportStory={() => setIsExportModalOpen(true)}
+      onRegenerateTTS={handleRegenerateTTS}
+      ttsLoaded={ttsLoaded}
+      ttsGenerating={ttsGenerating}
+      ttsProgress={ttsProgress}
+      memoryBar={memoryBar}
+      progressBar={progressBar}
+      locationSuggestion={locationSuggestion}
+      commandPreview={commandPreview}
+      onDismissCommandPreview={stopCommandPreview}
+    />
+  );
+
+  const rightPanel = (
+    <RightPanel
+      onLocationClick={() => setIsLocationModalOpen(true)}
+      language={language}
+      setLanguage={setLanguage}
+    />
+  );
+
+  return (
+    <div
+      className={`flex ${isMobile ? "flex-col" : ""} h-screen p-4 text-sm md:text-base bg-background bg-cover bg-center overflow-hidden`}
+      style={{
+        // A background-colored overlay composited over the image fades it toward the theme background.
+        // Dropped while the UI is hidden, so the eye toggle reveals the raw image.
+        backgroundImage: locationBackground
+          ? `${
+              !uiHidden && backgroundOverlay > 0
+                ? `linear-gradient(hsl(var(--background) / ${backgroundOverlay}), hsl(var(--background) / ${backgroundOverlay})), `
+                : ""
+            }${currentLocation ? `url(${currentLocation.backgroundImage})` : "url(./default-background.jpg)"}`
+          : undefined,
+      }}
+    >
+      <ThemedToastContainer />
+
+      {isMobile && !uiHidden && (
+        <div className="flex shrink-0 gap-1 mb-1">
+          {[
+            { key: "character", label: "Character" },
+            { key: "game", label: "Game" },
+            { key: "status", label: "Status" },
+          ].map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setMobilePanel(t.key)}
+              className={`flex-1 rounded py-2 text-sm ${
+                mobilePanel === t.key
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {!uiHidden && (isMobile ? (
+        <div className="flex-grow min-h-0 flex flex-col">
+          {mobilePanel === "character" && leftPanel}
+          {mobilePanel === "game" && middlePanel}
+          {mobilePanel === "status" && rightPanel}
+        </div>
+      ) : (
+        <>
+          {leftPanel}
+          {middlePanel}
+          {rightPanel}
+        </>
+      ))}
+
+      {/* Hide-UI toggle: reveals the background image. While the UI is hidden the button
+          fades out completely until hovered, so it doesn't obscure the background. */}
+      <Button
+        onClick={() => setUiHidden((h) => !h)}
+        title={uiHidden ? "Show UI" : "Hide UI"}
+        className={`absolute bottom-2 left-2 z-30 flex items-center justify-center rounded-full w-10 h-10 p-0 transition-opacity ${
+          uiHidden ? "opacity-0 hover:opacity-100" : "opacity-100"
+        }`}
+      >
+        {uiHidden ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+      </Button>
+
+      {/* BGM + AI-context buttons */}
+      {!uiHidden && (
+      <div className="absolute top-16 left-2 md:top-2 flex gap-2">
+        <Button
+          onClick={() => setBgmEnabled(!bgmEnabled)}
+          className="flex items-center justify-center rounded-full w-10 h-10 p-0"
+        >
+          <Music
+            className={`h-5 w-5 ${bgmEnabled ? "" : "text-muted-foreground"}`}
+          />
+        </Button>
+        <Button
+          onClick={() => setIsDebugOpen(true)}
+          className="flex items-center justify-center rounded-full w-10 h-10 p-0"
+          title="Show the full AI context sent each turn"
+        >
+          <ScrollText className="h-5 w-5" />
+        </Button>
+      </div>
+      )}
+
+      {/* Edit-world + Menu buttons */}
+      {!uiHidden && (
+      <div className="absolute top-16 right-2 md:top-2 flex gap-2">
+        <Button
+          onClick={() => setIsEditingWorld(true)}
+          className="flex items-center justify-center rounded-full w-10 h-10 p-0"
+          title="Edit World"
+        >
+          <SquarePen className="h-5 w-5" />
+        </Button>
+        <MenuModal
+          onSettingsClick={() => setIsSettingsOpen(true)}
+          onSave={(name) => saveGame(name, worldOverview.name)}
+          onLoad={(name) => loadGame(name, locations)}
+          worldOverview={worldOverview}
+          onExitToMenu={onExitToMenu}
+        />
+      </div>
+      )}
+
+      {/* Modals */}
+      {readmeText && (
+        <ReadmeModal
+          readme={readmeText}
+          open={showReadmeModal}
+          onOpenChange={setShowReadmeModal}
+          show={showReadme(worldId)}
+          onShowChange={(s) => setShowReadme(worldId, s)}
+        />
+      )}
+
+      {selectedEntity && (
+        <EntityModal
+          entity={entities.find((f) =>
+            f.name.length >= selectedEntity.length
+              ? f.name.substring(0, selectedEntity.length) === selectedEntity
+              : selectedEntity.substring(0, f.name.length) === f.name,
+          ) ?? null}
+          isOpen={isEntityModalOpen}
+          onOpenChange={setIsEntityModalOpen}
+        />
+      )}
+
+      <LocationModal
+        isOpen={isLocationModalOpen}
+        onOpenChange={setIsLocationModalOpen}
+        locations={locations}
+        changeLocation={changeLocation}
+      />
+
+
+      {/* Edit-world popup: non-fullscreen; keeps GameViewer + live session mounted */}
+      <Dialog
+        open={isEditingWorld}
+        onOpenChange={(open) => {
+          if (open) { setIsEditingWorld(true); return; }
+          // Guard close (X / Esc / overlay): prompt if there are pending edits.
+          if (isWorldDirty) setShowEditorExitPrompt(true);
+          else setIsEditingWorld(false);
+        }}
+      >
+        <DialogContent className="max-w-[95vw] w-[95vw] h-[90vh] p-0 overflow-hidden">
+          <WorldEditor embedded onClose={() => setIsEditingWorld(false)} />
+        </DialogContent>
+      </Dialog>
+      <UnsavedChangesDialog
+        open={showEditorExitPrompt}
+        onOpenChange={setShowEditorExitPrompt}
+        onSave={async () => { await saveWorld(); setShowEditorExitPrompt(false); setIsEditingWorld(false); }}
+        onExit={() => { setShowEditorExitPrompt(false); setIsEditingWorld(false); }}
+      />
+
+      {/* Full AI context sent each turn, paginated by turn */}
+      <Dialog open={isDebugOpen} onOpenChange={setIsDebugOpen}>
+        <DialogContent className="max-w-[90vw] w-[90vw] h-[85vh] flex flex-col overflow-hidden">
+          {(() => {
+            const palette = HIGHLIGHT_PALETTE;
+            const colorMap: Record<string, string> = {};
+            // Trigger keywords highlight in the narrative/history (showing why an entry
+            // activated); inside the injected "Foreground Lore:" block only the entry
+            // name declaration ("Name:") highlights — not keyword occurrences in the value.
+            const triggerRules: HighlightRule[] = [];
+            const declarationRules: HighlightRule[] = [];
+            dictionary.forEach((entry, i) => {
+              const color = palette[i % palette.length];
+              colorMap[entry.id] = color;
+              if (disabledHighlights[entry.id]) return;
+              parseKeywords(entry).forEach((term) => triggerRules.push({ term, color }));
+              if (entry.name) declarationRules.push({ term: `${entry.name}:`, color });
+            });
+            // The late dictionary block header, in either section style (## Foreground Lore / FOREGROUND LORE:).
+            const RELEVANT_MARKER = /^#{0,6}[ \t]*Foreground Lore:?/im;
+            // Highlight only a "Name:" at the start of a line — the declaration prepended by
+            // buildDictionaryContext — not a "Name:" that recurs inside the entry's value text.
+            const highlightDeclarations = (block: string) => {
+              const segments: HighlightSegment[] = [];
+              block.split("\n").forEach((line, li) => {
+                if (li > 0) segments.push({ text: "\n" });
+                const rule = declarationRules
+                  .filter((r) => line.startsWith(r.term))
+                  .sort((a, b) => b.term.length - a.term.length)[0];
+                if (rule) {
+                  segments.push({ text: rule.term, color: rule.color });
+                  segments.push({ text: line.slice(rule.term.length) });
+                } else if (line) {
+                  segments.push({ text: line });
+                }
+              });
+              return segments;
+            };
+            const searchTerms = debugSearch.trim().toLowerCase().split(/\s+/).filter(Boolean);
+            const searchActive = searchTerms.length > 0;
+            // Keep only lines matching any search term; collapse each run of dropped lines into "...".
+            const filterLines = (text: string) => {
+              const out = [];
+              let pendingGap = false;
+              let shownAny = false;
+              text.split("\n").forEach((line) => {
+                if (searchTerms.some((t) => line.toLowerCase().includes(t))) {
+                  if (pendingGap) out.push("...");
+                  out.push(line);
+                  shownAny = true;
+                  pendingGap = false;
+                } else {
+                  pendingGap = true;
+                }
+              });
+              if (shownAny && pendingGap) out.push("...");
+              return shownAny ? out.join("\n") : "";
+            };
+            // Section-aware highlight (+ optional search filter); returns [] when search hides everything.
+            const buildSegments = (text: string) => {
+              const idx = text.search(RELEVANT_MARKER);
+              let body = idx === -1 ? text : text.slice(0, idx);
+              let block = idx === -1 ? "" : text.slice(idx);
+              if (searchActive) {
+                body = filterLines(body);
+                block = filterLines(block);
+              }
+              const segs: HighlightSegment[] = [];
+              if (body) segs.push(...highlightSegments(body, triggerRules));
+              if (searchActive && body && block) segs.push({ text: "\n" });
+              if (block) segs.push(...highlightDeclarations(block));
+              return segs;
+            };
+            // Hydration highlighter: no section/declaration logic — just mark the (active) hydration terms,
+            // honoring the search filter and returning [] when search hides everything.
+            const buildHydrationSegments = (text: string, rules: HighlightRule[]): HighlightSegment[] => {
+              const t = searchActive ? filterLines(text) : text;
+              if (searchActive && !t) return [];
+              return highlightSegments(t, rules);
+            };
+            const renderSegs = (segs: HighlightSegment[]) =>
+              segs.map((seg, k) =>
+                seg.color ? (
+                  <mark
+                    key={k}
+                    style={{ backgroundColor: seg.color, color: "#000" }}
+                    className="rounded px-0.5"
+                  >
+                    {seg.text}
+                  </mark>
+                ) : (
+                  <span key={k}>{seg.text}</span>
+                ),
+              );
+            // Page = turn; show the requests captured for the currently selected (visible) turn.
+            const totalDebugPages = visibleDebugTurns.length;
+            const pageIndex = Math.min(Math.max(debugPage, 1), Math.max(totalDebugPages, 1)) - 1;
+            const currentTurn = visibleDebugTurns[pageIndex];
+            const currentRequests = currentTurn?.requests ?? [];
+            // The hydration signal for this turn: the action's keywords (matched vs summaries) + the action's
+            // entities (matched vs participation) — exactly what selectRehydrations sees. Deduped, colored.
+            const hydrationTerms: string[] = [];
+            const hydrationColorMap: Record<string, string> = {};
+            {
+              const seen = new Set<string>();
+              const action = currentTurn?.action || "";
+              const raw = [
+                ...extractKeywords(action, dictionary),
+                ...findEntityNames(action, allEntities, { requireCapital: false }),
+              ];
+              for (const term of raw) {
+                const key = term.toLowerCase();
+                if (term && !seen.has(key)) {
+                  seen.add(key);
+                  hydrationColorMap[key] = palette[hydrationTerms.length % palette.length];
+                  hydrationTerms.push(term);
+                }
+              }
+            }
+            const activeHydrationRules: HighlightRule[] = hydrationTerms
+              .filter((term) => !disabledHydrations[term])
+              .map((term) => ({ term, color: hydrationColorMap[term.toLowerCase()] }));
+            // Per-block segmenter honoring the mode: hydrations highlight only inside the narration request.
+            const segmentsFor = (text: string, reqType: string): HighlightSegment[] =>
+              debugHighlightMode === "hydrations"
+                ? buildHydrationSegments(text, reqType === "narration" ? activeHydrationRules : [])
+                : buildSegments(text);
+            // The memory digest for this turn (stored on its assistant message), if one has been generated.
+            const currentSummary = currentTurn?.turnId
+              ? fullMessageHistory
+                  .map((m) => (m.role === "assistant" ? parseTurnContent(m.content) : null))
+                  .find((c) => c?.turnId === currentTurn.turnId)?.summary
+              : undefined;
+            // Collapse keys: one per request group ("group-<i>"), one per request body, plus one per
+            // captured raw output ("out-<i>"). Collapse/expand all toggles every level.
+            const collapseKeys: (string | number)[] = [];
+            currentRequests.forEach((req, i) => {
+              collapseKeys.push(`group-${i}`);
+              collapseKeys.push(i);
+              if (typeof req.response === "string") collapseKeys.push(`out-${i}`);
+            });
+            const allCollapsed =
+              collapseKeys.length > 0 && collapseKeys.every((k) => collapsedDebug[k]);
+            const toggleAll = () => {
+              if (allCollapsed) {
+                setCollapsedDebug({});
+              } else {
+                const next: Record<string | number, boolean> = {};
+                collapseKeys.forEach((k) => { next[k] = true; });
+                setCollapsedDebug(next);
+              }
+            };
+            const renderDebugPaginationItems = () => {
+              const items = [];
+              for (let i = 1; i <= totalDebugPages; i++) {
+                if (i === 1 || i === totalDebugPages || (i >= debugPage - 1 && i <= debugPage + 1)) {
+                  items.push(
+                    <PaginationItem key={i}>
+                      <PaginationLink
+                        href="#"
+                        onClick={(e) => { e.preventDefault(); setDebugPage(i); }}
+                        isActive={debugPage === i}
+                      >
+                        {i}
+                      </PaginationLink>
+                    </PaginationItem>,
+                  );
+                } else if (i === debugPage - 2 || i === debugPage + 2) {
+                  items.push(
+                    <PaginationItem key={i}>
+                      <PaginationEllipsis />
+                    </PaginationItem>,
+                  );
+                }
+              }
+              return items;
+            };
+            return (
+              <>
+                <DialogHeader className="flex-shrink-0">
+                  <div className="flex items-center justify-between gap-2 pr-8">
+                    <DialogTitle>AI context</DialogTitle>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="gap-1.5"
+                      onClick={handleExportDebugContext}
+                      disabled={debugTurns.length === 0}
+                      title="Download the full turn history as JSON"
+                    >
+                      <Download className="h-4 w-4" />
+                      Export
+                    </Button>
+                  </div>
+                </DialogHeader>
+                <div className="flex flex-wrap items-center gap-2 flex-shrink-0 text-xs">
+                  {/* Highlight-mode toggle: dictionary entries vs the per-turn rehydration signal. */}
+                  <div className="inline-flex flex-shrink-0 overflow-hidden rounded border border-border">
+                    {(["dictionary", "hydrations"] as const).map((m) => (
+                      <button
+                        key={m}
+                        onClick={() => setDebugHighlightMode(m)}
+                        className={`px-2 py-0.5 ${
+                          debugHighlightMode === m ? "bg-muted font-medium" : "text-muted-foreground"
+                        }`}
+                      >
+                        {m === "dictionary" ? "Dictionary" : "Hydrations"}
+                      </button>
+                    ))}
+                  </div>
+                  {debugHighlightMode === "dictionary" ? (
+                    dictionary.length > 0 ? (
+                      dictionary.map((entry) => {
+                        const disabled = disabledHighlights[entry.id];
+                        return (
+                          <button
+                            key={entry.id}
+                            onClick={() =>
+                              setDisabledHighlights((prev) => ({ ...prev, [entry.id]: !prev[entry.id] }))
+                            }
+                            className="rounded border px-1.5 py-0.5"
+                            style={
+                              disabled
+                                ? { borderColor: colorMap[entry.id], opacity: 0.5 }
+                                : { backgroundColor: colorMap[entry.id], borderColor: colorMap[entry.id], color: "#000" }
+                            }
+                            title={disabled ? "Click to enable highlight" : "Click to disable highlight"}
+                          >
+                            {entry.name || parseKeywords(entry)[0] || "unnamed"}
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <span className="text-muted-foreground">No dictionary entries.</span>
+                    )
+                  ) : hydrationTerms.length > 0 ? (
+                    hydrationTerms.map((term) => {
+                      const disabled = disabledHydrations[term];
+                      const color = hydrationColorMap[term.toLowerCase()];
+                      return (
+                        <button
+                          key={term}
+                          onClick={() =>
+                            setDisabledHydrations((prev) => ({ ...prev, [term]: !prev[term] }))
+                          }
+                          className="rounded border px-1.5 py-0.5"
+                          style={
+                            disabled
+                              ? { borderColor: color, opacity: 0.5 }
+                              : { backgroundColor: color, borderColor: color, color: "#000" }
+                          }
+                          title={disabled ? "Click to enable highlight" : "Click to disable highlight"}
+                        >
+                          {term}
+                        </button>
+                      );
+                    })
+                  ) : (
+                    <span className="text-muted-foreground">No hydration terms for this turn.</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <div className="relative flex-grow">
+                    <Search className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                    <Input
+                      value={debugSearch}
+                      onChange={(e) => setDebugSearch(e.target.value)}
+                      placeholder="Search lines (space-separated terms)…"
+                      className="pl-8 h-8 text-xs"
+                    />
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={toggleAll}
+                    disabled={searchActive || currentRequests.length === 0}
+                    className="h-8 flex-shrink-0 gap-1"
+                    title={searchActive ? "Disabled while searching" : undefined}
+                  >
+                    {allCollapsed ? (
+                      <ChevronsUpDown className="h-4 w-4" />
+                    ) : (
+                      <ChevronsDownUp className="h-4 w-4" />
+                    )}
+                    {allCollapsed ? "Expand all" : "Collapse all"}
+                  </Button>
+                  <label className="flex flex-shrink-0 items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none">
+                    <Checkbox
+                      checked={debugCurrentContextOnly}
+                      onCheckedChange={(checked) => setDebugCurrentContextOnly(checked === true)}
+                    />
+                    Current context only
+                  </label>
+                </div>
+                {currentTurn && (
+                  <div className="flex-shrink-0 text-xs text-muted-foreground truncate">
+                    <span className={currentTurn.regenerated || currentTurn.pruned ? "line-through" : ""}>
+                      Turn {pageIndex + 1} of {totalDebugPages}
+                      {currentTurn.action ? ` — "${currentTurn.action}"` : ""}
+                    </span>
+                    {currentTurn.regenerated ? (
+                      <span className="ml-2 font-medium text-warning">Re-generated</span>
+                    ) : currentTurn.pruned ? (
+                      <span className="ml-2 font-medium text-warning">Pruned</span>
+                    ) : null}
+                  </div>
+                )}
+                {showSilentRequests && currentSummary && (
+                  <div className="flex-shrink-0 rounded-md border border-border bg-muted/40 p-2 text-xs">
+                    <div className="mb-1 font-semibold text-muted-foreground">Memory summary</div>
+                    <pre className="whitespace-pre-wrap break-words">{currentSummary}</pre>
+                  </div>
+                )}
+                <div className="flex-grow min-h-0">
+                  <ScrollArea className="h-full">
+                    <div className="space-y-4 text-xs">
+                      {totalDebugPages === 0 ? (
+                        <p className="text-muted-foreground">
+                          {debugCurrentContextOnly && debugTurns.length > 0
+                            ? "Only re-generated, rolled-back, or aborted turns exist. Uncheck “Current context only” to see them."
+                            : "No AI context captured yet. Take an action first, then reopen this."}
+                        </p>
+                      ) : (
+                        currentRequests.map((req, i) => {
+                          const msgSegs = req.messages.map((m) => ({
+                            role: m.role,
+                            segs: segmentsFor(m.content, req.type),
+                          }));
+                          const hasReqMatch = msgSegs.some((ms) => ms.segs.length > 0);
+                          // Raw, unmodified AI output for this request (captured in makeAIRequest).
+                          const outSegs =
+                            typeof req.response === "string" ? segmentsFor(req.response, req.type) : null;
+                          const hasOutMatch = outSegs !== null && outSegs.length > 0;
+                          // While searching, drop the whole block only if neither the request nor its output matches.
+                          if (searchActive && !hasReqMatch && !hasOutMatch) return null;
+                          const groupOpen = searchActive ? true : !collapsedDebug[`group-${i}`];
+                          const reqOpen = searchActive ? true : !collapsedDebug[i];
+                          const outOpen = searchActive ? true : !collapsedDebug[`out-${i}`];
+                          return (
+                            <Collapsible
+                              key={i}
+                              open={groupOpen}
+                              onOpenChange={(o) =>
+                                setCollapsedDebug((prev) => ({ ...prev, [`group-${i}`]: !o }))
+                              }
+                              className="border border-border rounded-md"
+                            >
+                              <CollapsibleTrigger asChild>
+                                <button className="flex w-full items-center justify-between gap-2 p-2 text-left font-semibold">
+                                  <span>Request {i + 1}: {req.type}</span>
+                                  {groupOpen ? (
+                                    <ChevronDown className="h-4 w-4 flex-shrink-0" />
+                                  ) : (
+                                    <ChevronRight className="h-4 w-4 flex-shrink-0" />
+                                  )}
+                                </button>
+                              </CollapsibleTrigger>
+                              <CollapsibleContent className="space-y-2 p-2 pt-0">
+                                {(!searchActive || hasReqMatch) && (
+                                  <Collapsible
+                                    open={reqOpen}
+                                    onOpenChange={(o) =>
+                                      setCollapsedDebug((prev) => ({ ...prev, [i]: !o }))
+                                    }
+                                    className="border border-border rounded-md"
+                                  >
+                                    <CollapsibleTrigger asChild>
+                                      <button className="flex w-full items-center justify-between gap-2 p-2 text-left font-semibold">
+                                        <span>Prompt</span>
+                                        {reqOpen ? (
+                                          <ChevronDown className="h-4 w-4 flex-shrink-0" />
+                                        ) : (
+                                          <ChevronRight className="h-4 w-4 flex-shrink-0" />
+                                        )}
+                                      </button>
+                                    </CollapsibleTrigger>
+                                    <CollapsibleContent className="p-2 pt-0">
+                                      {msgSegs.map((ms, j) => {
+                                        if (searchActive && ms.segs.length === 0) return null;
+                                        return (
+                                          <div key={j} className="mb-2">
+                                            <div className="font-medium text-muted-foreground uppercase">
+                                              {ms.role}
+                                            </div>
+                                            <pre className="whitespace-pre-wrap break-words bg-muted/50 p-2 rounded">
+                                              {renderSegs(ms.segs)}
+                                            </pre>
+                                          </div>
+                                        );
+                                      })}
+                                    </CollapsibleContent>
+                                  </Collapsible>
+                                )}
+                                {outSegs !== null && (!searchActive || hasOutMatch) && (
+                                  <Collapsible
+                                    open={outOpen}
+                                    onOpenChange={(o) =>
+                                      setCollapsedDebug((prev) => ({ ...prev, [`out-${i}`]: !o }))
+                                    }
+                                    className="border border-border rounded-md"
+                                  >
+                                    <CollapsibleTrigger asChild>
+                                      <button className="flex w-full items-center justify-between gap-2 p-2 text-left font-semibold">
+                                        <span>Raw Output</span>
+                                        {outOpen ? (
+                                          <ChevronDown className="h-4 w-4 flex-shrink-0" />
+                                        ) : (
+                                          <ChevronRight className="h-4 w-4 flex-shrink-0" />
+                                        )}
+                                      </button>
+                                    </CollapsibleTrigger>
+                                    <CollapsibleContent className="p-2 pt-0">
+                                      <pre className="whitespace-pre-wrap break-words bg-muted/50 p-2 rounded">
+                                        {req.response ? (
+                                          renderSegs(outSegs)
+                                        ) : (
+                                          <span className="text-muted-foreground">(empty output)</span>
+                                        )}
+                                      </pre>
+                                    </CollapsibleContent>
+                                  </Collapsible>
+                                )}
+                              </CollapsibleContent>
+                            </Collapsible>
+                          );
+                        })
+                      )}
+                    </div>
+                  </ScrollArea>
+                </div>
+                {totalDebugPages > 1 && (
+                  <div className="flex-shrink-0 flex justify-center pt-2">
+                    <Pagination>
+                      <PaginationContent>
+                        <PaginationItem>
+                          <PaginationPrevious
+                            href="#"
+                            onClick={(e) => { e.preventDefault(); if (debugPage > 1) setDebugPage(debugPage - 1); }}
+                            className={debugPage === 1 ? "pointer-events-none opacity-50" : ""}
+                          />
+                        </PaginationItem>
+                        {renderDebugPaginationItems()}
+                        <PaginationItem>
+                          <PaginationNext
+                            href="#"
+                            onClick={(e) => { e.preventDefault(); if (debugPage < totalDebugPages) setDebugPage(debugPage + 1); }}
+                            className={debugPage === totalDebugPages ? "pointer-events-none opacity-50" : ""}
+                          />
+                        </PaginationItem>
+                      </PaginationContent>
+                    </Pagination>
+                  </div>
+                )}
+              </>
+            );
+          })()}
+        </DialogContent>
+      </Dialog>
+
+      {/* Potato PC Dialog */}
+      <ConfirmDialog
+        open={showPotatoPCDialog}
+        onOpenChange={setShowPotatoPCDialog}
+        title="Server is overwhelmed!"
+        description={
+          "By default the game uses the AI running on my potato PC and it is struggling with too many requests ☹️ I strongly recommend following my OpenRouter guide to setup a free account and use their free model that is 100 times more memory and 10x faster!"
+        }
+        onConfirm={() => {
+          window.open(
+            "https://fierylion.itch.io/formamorph/devlog/885513/quick-setup-guide-free-openrouter-setup",
+            "_blank",
+          );
+          setShowPotatoPCDialog(false);
+        }}
+        onCancel={() => setShowPotatoPCDialog(false)}
+      />
+
+      <TTSModal
+        ref={ttsModalRef}
+        isOpen={isTTSModalOpen}
+        onOpenChange={setIsTTSModalOpen}
+        onLoadedChange={setTtsLoaded}
+      />
+
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onOpenChange={setIsSettingsOpen}
+        previewValues={promptPreviewValues}
+      />
+
+      <AlertDialog open={isExportModalOpen} onOpenChange={setIsExportModalOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Export story</AlertDialogTitle>
+            <AlertDialogDescription>
+              Download every turn&apos;s narration as a single file. Markdown keeps the formatting
+              (<strong>bold</strong>, headings, lists); plain text is unformatted.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => exportStory('txt')}>Plain text (.txt)</AlertDialogAction>
+            <AlertDialogAction onClick={() => exportStory('md')}>Markdown (.md)</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+};
+
+export default GameViewer;

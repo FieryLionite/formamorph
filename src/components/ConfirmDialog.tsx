@@ -1,0 +1,60 @@
+import { type ReactNode } from "react"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "./ui/alert-dialog"
+
+/**
+ * Yes/no confirmation prompt wrapping the Radix `AlertDialog`. Works controlled (`open`/`onOpenChange`)
+ * or trigger-driven (pass `children` as the trigger); both `onConfirm`/`onCancel` are optional.
+ */
+export function ConfirmDialog({
+  title = "Are you sure?",
+  description = "This action cannot be undone.",
+  onConfirm,
+  onCancel,
+  children,
+  open,
+  onOpenChange,
+}: {
+  title?: ReactNode
+  description?: ReactNode
+  onConfirm?: () => void
+  onCancel?: () => void
+  children?: ReactNode
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+}) {
+  const handleConfirm = () => {
+    onConfirm?.()
+  }
+
+  const handleCancel = () => {
+    onCancel?.()
+  }
+
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      {children && <AlertDialogTrigger asChild>{children}</AlertDialogTrigger>}
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{title}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {description}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel onClick={handleCancel}>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={handleConfirm}>Confirm</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}

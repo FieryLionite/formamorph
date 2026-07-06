@@ -1,0 +1,85 @@
+{
+  "_comment": "Copy this to profiles.json (git-excluded) and fill in your local endpoint + model ids. endpointUrl/apiToken/modelName point at your local OpenAI-compatible server (koboldcpp, LM Studio, tabbyAPI, ...). Each profile's `settings` are seeded into localStorage before the app boots; `script` is the fixed action list.",
+  "endpointUrl": "http://localhost:5001/v1/chat/completions",
+  "apiToken": "",
+  "settleMs": 4000,
+  "models": [
+    { "label": "rocinante-12b", "modelName": "REPLACE_WITH_YOUR_SERVER_MODEL_ID" },
+    { "label": "cydonia-24b", "modelName": "REPLACE_WITH_YOUR_SERVER_MODEL_ID" }
+  ],
+  "profiles": [
+    {
+      "name": "A",
+      "settings": {
+        "thinkingMode": "off",
+        "markdownOutput": false,
+        "choicesEnabled": false,
+        "statUpdatesEnabled": false,
+        "locationChangeEnabled": false,
+        "memoryDigests": false,
+        "characterDiaries": false,
+        "showSilentRequests": false,
+        "paragraphLimit": "auto",
+        "language": "English"
+      },
+      "script": [
+        "START GAME",
+        "I read the notices nailed to the leaning post.",
+        "I ask the ferryman to take me across before dark.",
+        "I tie my usual tollow-knot in the mooring rope while I wait.",
+        "I heave my pack onto the ferry and grip the tar-black rope.",
+        "I glance at the eel-smoker and ask if she's crossing too.",
+        "I tell them both my name is Wren."
+      ]
+    },
+    {
+      "name": "B",
+      "settings": {
+        "thinkingMode": "staged",
+        "markdownOutput": true,
+        "choicesEnabled": true,
+        "statUpdatesEnabled": true,
+        "locationChangeEnabled": true,
+        "memoryDigests": false,
+        "characterDiaries": false,
+        "showSilentRequests": true,
+        "paragraphLimit": "auto",
+        "language": "English"
+      },
+      "script": [
+        "START GAME",
+        "I read the notices nailed to the leaning post.",
+        "I ask the ferryman to take me across before dark.",
+        "I tie my usual tollow-knot in the mooring rope while I wait.",
+        "I heave my pack onto the ferry and grip the tar-black rope.",
+        "I pull hand over hand across the gloamwater to the far bank.",
+        "I raise my empty hands and tell the watchman I'm only a mapmaker."
+      ]
+    },
+    {
+      "name": "C",
+      "settings": {
+        "thinkingMode": "off",
+        "markdownOutput": false,
+        "choicesEnabled": true,
+        "statUpdatesEnabled": false,
+        "locationChangeEnabled": true,
+        "locationAutoApply": true,
+        "memoryDigests": false,
+        "characterDiaries": false,
+        "showSilentRequests": true,
+        "paragraphLimit": "auto",
+        "language": "English"
+      },
+      "script": [
+        "START GAME",
+        "I heave my pack up and make my way up the winding path into the common green.",
+        "I set my pack down by the well and study the low blue-doored cottage across the way, wondering who keeps it.",
+        "I cup my hands, call toward the cottage naming myself as Wren the mapmaker, and ask whoever keeps it to step out and speak with me.",
+        "I draw water from the well and offer it to her, and weary from the road myself, gently ask what name she'd have me call her by.",
+        "I ask her whether the path down to the eelhouse floods at high water, and how the eels are running.",
+        "I take my leave of her and wander over to the eelhouse to look the eel-racks over."
+      ]
+    }
+  ]
+}
